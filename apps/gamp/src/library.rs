@@ -45,8 +45,8 @@ pub enum Page {
 impl Page {
     pub fn key(&self) -> String {
         match self {
-            Page::List { sid, node, .. } => format!("{sid}\u{1f}{node}"),
-            Page::Search { sid, .. } => format!("{sid}\u{1f}search"),
+            Page::List { sid, node, .. } => list_key(sid, node),
+            Page::Search { sid, .. } => list_key(sid, "search"),
             Page::Settings => "settings".into(),
         }
     }
@@ -70,8 +70,18 @@ pub struct LibState {
     pub page: Page,
     pub trail: Vec<Page>,
     pub cache: HashMap<String, Listing>,
+    /// Folders open on each page (`page.key()` → folder ids). Nested ids stay when a folder closes.
+    pub expanded: HashMap<String, BTreeSet<String>>,
     /// The rows shown, as items (filtered and sorted).
     pub items: Vec<Item>,
+    /// Depth of each `items` row.
+    pub levels: Vec<u8>,
+    /// A folder play waiting on its listing (`listing key`, enqueue).
+    pub pending_play: Option<(String, bool)>,
+    /// Child browse that failed, so the row can say why.
+    pub failed: HashMap<String, String>,
+    /// Child listings already asked for.
+    pub inflight: BTreeSet<String>,
     pub actions: Vec<Action>,
     pub hint: Option<String>,
     pub filter: String,
@@ -113,7 +123,12 @@ impl Default for LibState {
             page: Page::List { sid: "local".into(), node: "audio".into(), title: "Local Media › Audio".into() },
             trail: Vec::new(),
             cache: HashMap::new(),
+            expanded: HashMap::new(),
             items: Vec::new(),
+            levels: Vec::new(),
+            pending_play: None,
+            failed: HashMap::new(),
+            inflight: BTreeSet::new(),
             actions: Vec::new(),
             hint: None,
             filter: String::new(),
@@ -136,6 +151,51 @@ const FAVORITES_KEY: &str = "favorites\u{1f}favorites";
 
 fn is_playable(i: &Item) -> bool {
     i.kind == "track"
+}
+
+/// A stand-in row: still loading, or a browse that failed.
+fn is_filler(i: &Item) -> bool {
+    matches!(i.kind.as_str(), "loading" | "note")
+}
+
+fn list_key(sid: &str, node: &str) -> String {
+    format!("{sid}\u{1f}{node}")
+}
+
+fn item_text_has(i: &Item, filter: &str) -> bool {
+    format!("{} {} {} {}", i.artist, i.title, i.album, i.info).to_lowercase().contains(filter)
+}
+
+fn sort_key(i: &Item, col: &str) -> String {
+    match col {
+        "Artist" | "Genre" => i.artist.to_lowercase(),
+        "Album" | "Format" => i.album.to_lowercase(),
+        "Length" => format!("{:010}", i.duration.unwrap_or(0.0) as u64),
+        "Items" => format!("{:010}", i.count.unwrap_or(0)),
+        "Posted" => i.date.clone(),
+        "Plays" => format!("{:012}", i.plays.unwrap_or(0)),
+        "Likes" => format!("{:012}", i.likes.unwrap_or(0)),
+        _ => i.title.to_lowercase(),
+    }
+}
+
+/// Rows that were selected before `lib_show` rebuilt the table, matched by id and depth.
+struct Kept {
+    selected: Vec<(String, u8)>,
+    anchor: Option<(String, u8)>,
+    /// The anchor row was inside the visible window.
+    visible: bool,
+}
+
+/// Inputs shared by one `lib_show` walk. Children are collected aside so a
+/// folder the filter rejects can drop them.
+struct Walk<'a> {
+    sid: &'a str,
+    open: &'a BTreeSet<String>,
+    filter: &'a str,
+    sort: Option<(&'a str, bool)>,
+    stack: &'a mut BTreeSet<String>,
+    fetches: &'a mut Vec<(String, String)>,
 }
 
 impl App {
@@ -165,32 +225,7 @@ impl App {
                     self.lib.sources = s;
                     self.lib_tree();
                 }
-                Reply::Listing { key, result } => {
-                    self.lib.loading = false;
-                    match result {
-                        Ok(l) => {
-                            let play_now = self.pending_stream && !l.items.is_empty() && l.items.iter().all(|i| i.live || i.url.is_some());
-                            self.pending_stream = false;
-                            let items = l.items.clone();
-                            self.lib.cache.insert(key.clone(), l);
-                            if self.lib.page.key() == key {
-                                self.lib_show();
-                            }
-                            if play_now {
-                                self.lib_send(items, false);
-                            }
-                        }
-                        Err(e) => {
-                            if self.lib.page.key() == key {
-                                self.lib.items.clear();
-                                self.lib.hint = Some(e.clone());
-                                self.lib_rows();
-                            }
-                            self.last_error = Some(e.clone());
-                            self.lib.view.status = e;
-                        }
-                    }
-                }
+                Reply::Listing { key, result } => self.lib_listing(key, result),
                 Reply::Config(c) => {
                     if let Some(k) = c["soundcloud"]["profile"].as_str() {
                         self.lib_field_default("sc_profile", k);
@@ -344,6 +379,15 @@ impl App {
     // ---- pages ----------------------------------------------------------------
 
     pub fn lib_open(&mut self, page: Page, from_tree: bool) {
+        // A page opened again fetches itself and any folder that failed last time.
+        self.lib_drop_failure(&page.key());
+        if let Page::List { sid, .. } | Page::Search { sid, .. } = &page {
+            let sid = sid.clone();
+            let ids: Vec<String> = self.lib.expanded.get(&page.key()).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+            for id in ids {
+                self.lib_drop_failure(&list_key(&sid, &id));
+            }
+        }
         if from_tree {
             self.lib.trail.clear();
         }
@@ -353,6 +397,7 @@ impl App {
         self.lib.anchor = None;
         self.lib.sort = None;
         self.lib.filter.clear();
+        self.lib.levels.clear();
         self.lib.view.back = !self.lib.trail.is_empty();
         self.lib.view.crumb = if self.lib.trail.is_empty() { String::new() } else { match &page { Page::List { title, .. } => title.clone(), _ => String::new() } };
         self.lib.view.form = None;
@@ -388,6 +433,7 @@ impl App {
                     self.lib_show();
                 } else {
                     self.lib.items.clear();
+                    self.lib.levels.clear();
                     self.lib.hint = None;
                     self.lib_rows();
                 }
@@ -401,6 +447,7 @@ impl App {
                     self.lib_show();
                 } else {
                     self.lib.items.clear();
+                    self.lib.levels.clear();
                     self.lib.hint = None;
                     self.lib_rows();
                     self.lib.view.status = "Loading…".into();
@@ -415,38 +462,226 @@ impl App {
         self.mark(Kind::Library);
     }
 
-    pub fn lib_show(&mut self) {
-        let Some(l) = self.lib.cache.get(&self.lib.page.key()) else { return };
-        self.lib.actions = l.actions.clone();
-        self.lib.hint = l.hint.clone();
-        let mut items = l.items.clone();
-        let f = self.lib.filter.to_lowercase();
-        if !f.is_empty() {
-            items.retain(|i| format!("{} {} {} {}", i.artist, i.title, i.album, i.info).to_lowercase().contains(&f));
+    fn lib_page_sid(&self) -> Option<String> {
+        match &self.lib.page {
+            Page::List { sid, .. } | Page::Search { sid, .. } => Some(sid.clone()),
+            Page::Settings => None,
         }
-        if let Some((col, asc)) = self.lib.sort {
-            let key = |i: &Item| -> String {
-                match self.lib_columns(&l.items).get(col).map(|c| c.0.as_str()) {
-                    Some("Artist" | "Genre") => i.artist.to_lowercase(),
-                    Some("Album" | "Format") => i.album.to_lowercase(),
-                    Some("Length") => format!("{:010}", i.duration.unwrap_or(0.0) as u64),
-                    Some("Items") => format!("{:010}", i.count.unwrap_or(0)),
-                    Some("Posted") => i.date.clone(),
-                    Some("Plays") => format!("{:012}", i.plays.unwrap_or(0)),
-                    Some("Likes") => format!("{:012}", i.likes.unwrap_or(0)),
-                    _ => i.title.to_lowercase(),
-                }
-            };
-            items.sort_by_key(|i| key(i));
+    }
+
+    /// `key` is a listing opened from a folder on the page that's showing.
+    fn lib_is_open_child(&self, key: &str) -> bool {
+        let Some(sid) = self.lib_page_sid() else { return false };
+        if key == self.lib.page.key() {
+            return false;
+        }
+        let Some(node) = key.strip_prefix(&format!("{sid}\u{1f}")) else { return false };
+        self.lib.expanded.get(&self.lib.page.key()).is_some_and(|s| s.contains(node))
+    }
+
+    /// A cached descendant matches the filter, so a collapsed folder stays listed.
+    fn lib_descendant_hit(&self, sid: &str, item: &Item, filter: &str, seen: &mut BTreeSet<String>) -> bool {
+        if sid.is_empty() || item.kind != "folder" || !seen.insert(item.id.clone()) {
+            return false;
+        }
+        let Some(children) = self.lib.cache.get(&list_key(sid, &item.id)).map(|l| l.items.clone()) else { return false };
+        children.iter().any(|c| (!is_filler(c) && item_text_has(c, filter)) || self.lib_descendant_hit(sid, c, filter, seen))
+    }
+
+    /// One sibling list, then each expanded folder's children at depth + 1.
+    fn lib_append(&self, walk: &mut Walk<'_>, items: &[Item], depth: u8, out_items: &mut Vec<Item>, out_levels: &mut Vec<u8>) {
+        let mut siblings = items.to_vec();
+        if let Some((col, asc)) = walk.sort {
+            siblings.sort_by_key(|i| sort_key(i, col));
             if !asc {
-                items.reverse();
+                siblings.reverse();
             }
         }
+        for item in siblings {
+            if is_filler(&item) {
+                if walk.filter.is_empty() {
+                    out_items.push(item);
+                    out_levels.push(depth);
+                }
+                continue;
+            }
+            let id = item.id.clone();
+            let expanded = !walk.sid.is_empty() && item.kind == "folder" && walk.open.contains(&id);
+            let mut kids_i = Vec::new();
+            let mut kids_l = Vec::new();
+            if expanded && walk.stack.insert(id.clone()) {
+                let key = list_key(walk.sid, &id);
+                if let Some(children) = self.lib.cache.get(&key).map(|l| l.items.clone()) {
+                    self.lib_append(walk, &children, depth.saturating_add(1), &mut kids_i, &mut kids_l);
+                } else if let Some(err) = self.lib.failed.get(&key).cloned() {
+                    if walk.filter.is_empty() {
+                        kids_i.push(Item { kind: "note".into(), title: err, ..Default::default() });
+                        kids_l.push(depth.saturating_add(1));
+                    }
+                } else {
+                    if walk.filter.is_empty() {
+                        kids_i.push(Item { kind: "loading".into(), title: t("Loading…").into(), ..Default::default() });
+                        kids_l.push(depth.saturating_add(1));
+                    }
+                    if !self.lib.inflight.contains(&key) {
+                        walk.fetches.push((key, id.clone()));
+                    }
+                }
+                walk.stack.remove(&id);
+            }
+            let matched = walk.filter.is_empty() || item_text_has(&item, walk.filter);
+            let hidden_hit = !matched
+                && item.kind == "folder"
+                && !expanded
+                && self.lib_descendant_hit(walk.sid, &item, walk.filter, &mut BTreeSet::new());
+            if matched || hidden_hit || !kids_i.is_empty() {
+                out_items.push(item);
+                out_levels.push(depth);
+                out_items.append(&mut kids_i);
+                out_levels.append(&mut kids_l);
+            }
+        }
+    }
+
+    /// Visible rows for the page. `apply_sort` uses `columns` for the header the user clicked.
+    fn lib_flat(&self, top: &[Item], columns: &[(String, f32)], apply_sort: bool) -> (Vec<Item>, Vec<u8>, Vec<(String, String)>) {
+        let sid = self.lib_page_sid().unwrap_or_default();
+        let open = self.lib.expanded.get(&self.lib.page.key()).cloned().unwrap_or_default();
+        let filter = self.lib.filter.to_lowercase();
+        let sort = if apply_sort { self.lib.sort.and_then(|(c, asc)| columns.get(c).map(|(n, _)| (n.as_str(), asc))) } else { None };
+        let mut items = Vec::new();
+        let mut levels = Vec::new();
+        let mut fetches = Vec::new();
+        let mut stack = BTreeSet::new();
+        let mut walk = Walk { sid: &sid, open: &open, filter: &filter, sort, stack: &mut stack, fetches: &mut fetches };
+        self.lib_append(&mut walk, top, 0, &mut items, &mut levels);
+        (items, levels, fetches)
+    }
+
+    pub fn lib_show(&mut self) {
+        let Some((actions, hint, top_items)) = self.lib.cache.get(&self.lib.page.key()).map(|top| (top.actions.clone(), top.hint.clone(), top.items.clone())) else { return };
+        // Selection is a row index. Rows inserted above it would otherwise point it at something else.
+        let kept = self.lib_kept_rows();
+        self.lib.actions = actions;
+        self.lib.hint = hint;
+        // Columns follow whatever is actually on screen, which the sort key also needs.
+        let (mut items, mut levels, mut fetches) = self.lib_flat(&top_items, &[], false);
+        let columns = self.lib_columns(&items);
+        if self.lib.sort.is_some() {
+            (items, levels, fetches) = self.lib_flat(&top_items, &columns, true);
+        }
         self.lib.items = items;
+        self.lib.levels = levels;
+        if let Some(sid) = self.lib_page_sid() {
+            for (key, node) in fetches {
+                if self.lib.inflight.insert(key.clone())
+                    && let Some(b) = &self.backend
+                {
+                    b.browse(key, sid.clone(), node);
+                }
+            }
+        }
         self.lib_rows();
+        self.lib_restore_rows(kept);
+    }
+
+    /// Selected rows and the anchor, as item id plus depth, and whether the anchor was on screen.
+    fn lib_kept_rows(&self) -> Kept {
+        let selected = self.lib.view.table.selected.iter().copied().filter_map(|i| self.lib_mark(i)).collect();
+        let anchor = self.lib.anchor.and_then(|i| self.lib_mark(i));
+        let vis = self.lib.view.visible_rows();
+        let top = self.lib.view.table.top;
+        let visible = self.lib.anchor.is_some_and(|i| i >= top && i < top + vis);
+        Kept { selected, anchor, visible }
+    }
+
+    fn lib_mark(&self, i: usize) -> Option<(String, u8)> {
+        let depth = self.lib.levels.get(i).copied().unwrap_or(0);
+        self.lib.items.get(i).map(|it| (it.id.clone(), depth))
+    }
+
+    fn lib_restore_rows(&mut self, kept: Kept) {
+        let Kept { selected, anchor, visible } = kept;
+        let find = |id: &str, depth: u8| {
+            let same = |n: usize, it: &Item| it.id == id && self.lib.levels.get(n).copied().unwrap_or(0) == depth;
+            self.lib
+                .items
+                .iter()
+                .enumerate()
+                .find(|(n, it)| same(*n, it))
+                .or_else(|| self.lib.items.iter().enumerate().find(|(_, it)| it.id == id))
+                .map(|(n, _)| n)
+        };
+        let selected: BTreeSet<usize> = selected.iter().filter_map(|(id, depth)| find(id, *depth)).collect();
+        let anchor = anchor.and_then(|(id, depth)| find(&id, depth));
+        self.lib.view.table.selected = selected;
+        self.lib.anchor = anchor;
+        if visible && let Some(a) = self.lib.anchor {
+            let rows = self.lib.view.visible_rows();
+            let max = self.lib.view.max_top();
+            let t = &mut self.lib.view.table;
+            if a < t.top {
+                t.top = a;
+            } else if a >= t.top + rows {
+                t.top = a + 1 - rows;
+            }
+            t.top = t.top.min(max);
+        }
+    }
+
+    /// Forget a failed browse so the next show asks again.
+    fn lib_drop_failure(&mut self, key: &str) {
+        if self.lib.failed.remove(key).is_some() {
+            self.lib.inflight.remove(key);
+        }
+    }
+
+    fn lib_listing(&mut self, key: String, result: Result<Listing, String>) {
+        self.lib.loading = false;
+        self.lib.inflight.remove(&key);
+        match result {
+            Ok(l) => {
+                // A child folder's listing must not eat a play that is waiting on this page.
+                let for_page = self.lib.page.key() == key;
+                let play_now = for_page && self.pending_stream && !l.items.is_empty() && l.items.iter().all(|i| i.live || i.url.is_some());
+                if for_page {
+                    self.pending_stream = false;
+                }
+                let streamed = l.items.clone();
+                self.lib.failed.remove(&key);
+                self.lib.cache.insert(key.clone(), l);
+                if self.lib.page.key() == key || self.lib_is_open_child(&key) {
+                    self.lib_show();
+                }
+                if play_now {
+                    self.lib_send(streamed, false);
+                }
+                if let Some((_, enqueue)) = self.lib.pending_play.take_if(|(k, _)| k == &key) {
+                    let tracks = self.lib.cache.get(&key).map(|l| l.items.clone()).unwrap_or_default();
+                    self.lib_send(tracks, enqueue);
+                }
+            }
+            Err(e) => {
+                if self.lib.pending_play.as_ref().is_some_and(|(k, _)| k == &key) {
+                    self.lib.pending_play = None;
+                }
+                if self.lib_is_open_child(&key) {
+                    self.lib.failed.insert(key, e.clone());
+                    self.lib_show();
+                } else if self.lib.page.key() == key {
+                    self.lib.items.clear();
+                    self.lib.levels.clear();
+                    self.lib.hint = Some(e.clone());
+                    self.lib_rows();
+                }
+                self.last_error = Some(e.clone());
+                self.lib.view.status = e;
+            }
+        }
     }
 
     fn lib_columns(&self, items: &[Item]) -> Vec<(String, f32)> {
+        let items: Vec<&Item> = items.iter().filter(|i| !is_filler(i)).collect();
         let c = |l: &str, w: f32| (l.to_owned(), w);
         if !items.is_empty() && items.iter().all(|i| i.kind == museum::KIND) {
             return vec![c("Skin", 3.0), c("File", 2.0)];
@@ -465,18 +700,23 @@ impl App {
 
     /// Turns the items into table rows, buttons and status.
     fn lib_rows(&mut self) {
-        let all = self.lib.cache.get(&self.lib.page.key()).map(|l| l.items.clone()).unwrap_or_default();
-        let columns = self.lib_columns(&all);
+        let columns = self.lib_columns(&self.lib.items);
+        let length_is_last = columns.last().is_some_and(|(name, _)| name == "Length");
+        let open = self.lib.expanded.get(&self.lib.page.key()).cloned().unwrap_or_default();
+        let levels = self.lib.levels.clone();
         let rows: Vec<Row> = self
             .lib
             .items
             .iter()
-            .map(|i| {
+            .enumerate()
+            .map(|(n, i)| {
                 let cells = columns
                     .iter()
                     .map(|(c, _)| match c.as_str() {
                         "Artist" | "Genre" => i.artist.clone(),
                         "Album" | "Format" | "File" => i.album.clone(),
+                        // Track columns end in Length. A folder has no length; show how many it holds.
+                        "Length" if i.kind == "folder" && length_is_last => i.count.map(|n| n.to_string()).unwrap_or_default(),
                         "Length" => i.duration.map(clock).unwrap_or_default(),
                         "Items" => i.count.map(|n| n.to_string()).unwrap_or_default(),
                         "Posted" => i.date.clone(),
@@ -485,7 +725,14 @@ impl App {
                         _ => i.title.clone(),
                     })
                     .collect();
-                Row { cells, folder: i.kind == "folder", dim: is_preview(i) || i.info == gamp_core::soundcloud_web::PROTECTED, tip: i.info.clone() }
+                Row {
+                    cells,
+                    folder: i.kind == "folder",
+                    dim: is_filler(i) || is_preview(i) || i.info == gamp_core::soundcloud_web::PROTECTED,
+                    tip: i.info.clone(),
+                    depth: levels.get(n).copied().unwrap_or(0),
+                    open: i.kind == "folder" && open.contains(&i.id),
+                }
             })
             .collect();
         let t = &mut self.lib.view.table;
@@ -512,13 +759,14 @@ impl App {
             buttons.push(("action:fav:add".into(), "Add to Favorites".into()));
         }
         self.lib.view.buttons = buttons;
-        let total: f64 = self.lib.items.iter().filter_map(|i| i.duration).sum();
+        let listed_rows: Vec<&Item> = self.lib.items.iter().filter(|i| !is_filler(i)).collect();
+        let total: f64 = listed_rows.iter().filter_map(|i| i.duration).sum();
         let hours = if total > 3600.0 { format!(" · {:.1} h", total / 3600.0) } else { String::new() };
         let scanning = match (&self.lib.page, &self.lib.scan) {
             (Page::List { sid, .. }, Some(s)) if sid == "local" && s.scanning => format!(" · {}", tf("scanning… {} files", &[&s.scanned])),
             _ => String::new(),
         };
-        self.lib.view.status = format!("{}{hours}{scanning}", tf("{} items", &[&self.lib.items.len()]));
+        self.lib.view.status = format!("{}{hours}{scanning}", tf("{} items", &[&listed_rows.len()]));
         self.mark(Kind::Library);
     }
 
@@ -564,6 +812,12 @@ impl App {
             }
             Hot::Search => {
                 self.lib_focus(Some("search".into()));
+                return;
+            }
+            Hot::Disclose(i) => {
+                let i = *i;
+                self.lib_focus(None);
+                self.lib_toggle_folder(i);
                 return;
             }
             Hot::Row(i) => {
@@ -653,7 +907,96 @@ impl App {
         self.mark(Kind::Library);
     }
 
-    /// Double-click or Enter: open a folder, or play from that track.
+    /// Opens or closes a folder in place. The row stays put; its children come and go under it.
+    fn lib_toggle_folder(&mut self, i: usize) {
+        let Some(id) = self.lib.items.get(i).filter(|it| it.kind == "folder").map(|it| it.id.clone()) else { return };
+        let key = self.lib.page.key();
+        let opening = {
+            let set = self.lib.expanded.entry(key).or_default();
+            // Nested ids stay in the set, so closing and opening restores them.
+            if set.remove(&id) {
+                false
+            } else {
+                set.insert(id.clone());
+                true
+            }
+        };
+        if opening && let Some(sid) = self.lib_page_sid() {
+            self.lib_drop_failure(&list_key(&sid, &id));
+        }
+        self.lib.view.table.selected = BTreeSet::from([i]);
+        self.lib.anchor = Some(i);
+        self.lib_show();
+    }
+
+    fn lib_folder_open(&self, item: &Item) -> bool {
+        item.kind == "folder" && self.lib.expanded.get(&self.lib.page.key()).is_some_and(|s| s.contains(&item.id))
+    }
+
+    /// Left/right in the table: open, close, or step out to the parent row.
+    fn lib_side(&mut self, right: bool) {
+        let Some(i) = self.lib.view.table.selected.iter().next().copied() else { return };
+        let Some(item) = self.lib.items.get(i).cloned() else { return };
+        let open = self.lib_folder_open(&item);
+        if right {
+            if item.kind == "folder" && !open {
+                self.lib_toggle_folder(i);
+            }
+            return;
+        }
+        if open {
+            self.lib_toggle_folder(i);
+            return;
+        }
+        let depth = self.lib.levels.get(i).copied().unwrap_or(0);
+        let Some(p) = (0..i).rev().find(|&j| self.lib.levels.get(j).copied().unwrap_or(0) < depth) else { return };
+        self.lib.view.table.selected = BTreeSet::from([p]);
+        self.lib.anchor = Some(p);
+        let rows = self.lib.view.visible_rows();
+        let t = &mut self.lib.view.table;
+        if p < t.top {
+            t.top = p;
+        } else if p >= t.top + rows {
+            t.top = p + 1 - rows;
+        }
+        self.mark(Kind::Library);
+    }
+
+    /// The old double-click: this folder becomes the page.
+    pub fn lib_open_folder(&mut self) {
+        let Some(item) = self.lib_selected().into_iter().find(|i| i.kind == "folder") else { return };
+        let Some(sid) = self.lib_page_sid() else { return };
+        self.lib.trail.push(self.lib.page.clone());
+        self.lib_open(Page::List { sid, node: item.id, title: item.title }, false);
+    }
+
+    /// Plays the tracks in one folder's own listing. Sub-folders are not walked.
+    fn lib_play_folder(&mut self, folder: Item, enqueue: bool) {
+        let Some(sid) = self.lib_page_sid() else {
+            self.lib.view.status = "Open it to play what's inside.".into();
+            return;
+        };
+        let key = list_key(&sid, &folder.id);
+        if let Some(tracks) = self.lib.cache.get(&key).map(|l| l.items.iter().filter(|i| is_playable(i)).cloned().collect::<Vec<_>>()) {
+            if tracks.is_empty() {
+                self.lib.view.status = "Open it to play what's inside.".into();
+            } else {
+                self.lib_send(tracks, enqueue);
+            }
+            return;
+        }
+        self.lib.failed.remove(&key);
+        self.lib.pending_play = Some((key.clone(), enqueue));
+        if self.lib.inflight.insert(key.clone())
+            && let Some(b) = &self.backend
+        {
+            b.browse(key, sid, folder.id);
+        }
+        self.lib_show();
+        self.lib.view.status = "Loading…".into();
+    }
+
+    /// Double-click or Enter: expand a folder, or play from that track.
     fn lib_activate(&mut self, i: usize) {
         let Some(item) = self.lib.items.get(i).cloned() else { return };
         if item.kind == museum::KIND {
@@ -663,6 +1006,13 @@ impl App {
             if let Page::Search { sid, title } = self.lib.page.clone() {
                 self.lib_search_again(sid, title, item.title);
             }
+            return;
+        }
+        if is_filler(&item) {
+            return;
+        }
+        if item.kind == "folder" {
+            self.lib_toggle_folder(i);
             return;
         }
         if !is_playable(&item) {
@@ -726,7 +1076,7 @@ impl App {
     pub fn lib_row_menu(&mut self) -> Option<Vec<gamp_ui::menu::Item>> {
         use gamp_ui::menu::Item as M;
         let (x, y) = self.win(Kind::Library)?.cursor;
-        let Some(Hot::Row(i)) = self.lib_hot(x, y) else { return None };
+        let Some(Hot::Row(i) | Hot::Disclose(i)) = self.lib_hot(x, y) else { return None };
         if !self.lib.view.table.selected.contains(&i) {
             self.lib.view.table.selected = BTreeSet::from([i]);
             self.lib.anchor = Some(i);
@@ -740,10 +1090,15 @@ impl App {
         if sel.iter().any(|i| i.kind == museum::KIND) {
             return Some(vec![M::action("lib:skin", "Use skin"), M::action("skin:surprise", "Surprise me"), M::action("skin:default", "Original skin"), fav]);
         }
-        if !sel.iter().any(is_playable) {
+        let single_folder = sel.len() == 1 && sel[0].kind == "folder";
+        if !sel.iter().any(is_playable) && !sel.iter().any(|i| i.kind == "folder") {
             return Some(vec![fav]);
         }
-        let mut menu = vec![M::action("lib:play", "Play"), M::action("lib:enqueue", "Add to playlist (Shift+Enter)"), fav];
+        let mut menu = vec![M::action("lib:play", "Play"), M::action("lib:enqueue", "Add to playlist (Shift+Enter)")];
+        if single_folder {
+            menu.push(M::action("lib:open", "Open as its own list"));
+        }
+        menu.push(fav);
         if let Some(t) = self.lib.items.get(i).filter(|t| !t.artist_link.is_empty()) {
             let who = t.artist_link.rsplit('/').next().unwrap_or_default();
             menu.push(M::action("lib:artist", &tf("Latest from {}", &[&who])));
@@ -753,8 +1108,7 @@ impl App {
 
     pub fn lib_click_header(&mut self, c: usize) {
         // Dates and counts start with the newest or biggest.
-        let all = self.lib.cache.get(&self.lib.page.key()).map(|l| l.items.clone()).unwrap_or_default();
-        let up = !matches!(self.lib_columns(&all).get(c).map(|c| c.0.as_str()), Some("Posted" | "Plays" | "Likes" | "Length" | "Items"));
+        let up = !matches!(self.lib_columns(&self.lib.items).get(c).map(|c| c.0.as_str()), Some("Posted" | "Plays" | "Likes" | "Length" | "Items"));
         self.lib.sort = match self.lib.sort {
             Some((col, asc)) if col == c => Some((c, !asc)),
             _ => Some((c, up)),
@@ -793,11 +1147,17 @@ impl App {
     pub fn lib_button(&mut self, id: &str) {
         match id {
             "play" | "enqueue" => {
+                let enqueue = id == "enqueue";
                 let sel = self.lib_selected();
                 if sel.is_empty() {
                     self.lib.view.status = "Select some tracks first.".into();
+                } else if sel.iter().any(is_playable) {
+                    self.lib_send(sel, enqueue);
+                } else if sel.iter().any(|i| i.kind == "folder") {
+                    let folder = sel.into_iter().find(|i| i.kind == "folder").unwrap();
+                    self.lib_play_folder(folder, enqueue);
                 } else {
-                    self.lib_send(sel, id == "enqueue");
+                    self.lib_send(sel, enqueue);
                 }
             }
             "playall" => self.lib_send(self.lib.items.clone(), false),
@@ -867,6 +1227,14 @@ impl App {
                 Key::Named(NamedKey::Backspace) if !self.lib.trail.is_empty() => {
                     let prev = self.lib.trail.pop().unwrap();
                     self.lib_open(prev, false);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.lib_side(true);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.lib_side(false);
                     return true;
                 }
                 Key::Named(d @ (NamedKey::ArrowDown | NamedKey::ArrowUp)) => {
@@ -1011,6 +1379,7 @@ impl App {
                     self.lib.view.status = "Searching…".into();
                     self.lib.cache.remove(&self.lib.page.key());
                     self.lib.items.clear();
+                    self.lib.levels.clear();
                     self.lib_rows();
                     if let Some(b) = &self.backend {
                         b.search(self.lib.page.key(), sid.clone(), q.clone());
@@ -1282,6 +1651,246 @@ mod tests {
 
     use super::*;
     use crate::backend::Backend;
+    use winit::keyboard::{Key, NamedKey};
+
+    fn track(id: &str, title: &str) -> Item {
+        Item { url: Some(format!("/m/{id}")), ..Item::track(id, title) }
+    }
+
+    fn titles(app: &App) -> Vec<String> {
+        app.lib.items.iter().map(|i| i.title.clone()).collect()
+    }
+
+    fn menu_ids(items: Option<Vec<gamp_ui::menu::Item>>) -> Vec<String> {
+        items.into_iter().flatten().filter_map(|i| match i { gamp_ui::menu::Item::Action { id, .. } => Some(id), _ => None }).collect()
+    }
+
+    #[test]
+    fn expanding_a_folder_inserts_its_children_and_collapsing_removes_them() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("a", "A").items(Some(2)), Item::folder("b", "B")]));
+        app.lib.cache.insert(list_key("plex", "a"), Listing::of(vec![track("t1", "One"), track("t2", "Two")]));
+        app.lib_show();
+        assert_eq!(titles(&app), ["A", "B"]);
+        assert_eq!(app.lib.levels, vec![0, 0]);
+
+        app.lib_activate(0);
+        assert_eq!(app.lib.page, page);
+        assert!(app.lib.trail.is_empty());
+        assert_eq!(titles(&app), ["A", "One", "Two", "B"]);
+        assert_eq!(app.lib.levels, vec![0, 1, 1, 0]);
+        assert!(app.lib.view.table.rows[0].open);
+        assert_eq!(app.lib.view.table.rows[1].depth, 1);
+
+        // B has no listing yet: a dim placeholder, and no second request while that one is in flight.
+        app.lib_activate(3);
+        assert_eq!(app.lib.items[4].kind, "loading");
+        assert_eq!(app.lib.items[4].title, "Loading…");
+        assert!(app.lib.view.table.rows[4].dim);
+        assert_eq!(app.lib.levels, vec![0, 1, 1, 0, 1]);
+        assert!(app.lib.inflight.contains(&list_key("plex", "b")));
+        let asked = app.lib.inflight.clone();
+        app.lib_show();
+        assert_eq!(app.lib.inflight, asked);
+
+        app.lib_listing(list_key("plex", "b"), Err("nope".into()));
+        assert_eq!(app.lib.items.last().unwrap().kind, "note");
+        assert_eq!(app.lib.items.last().unwrap().title, "nope");
+        assert!(app.lib.view.table.rows.last().unwrap().dim);
+        assert_eq!(app.lib.view.status, "nope");
+        assert_eq!(app.lib.items[0].title, "A", "a failed child browse leaves the page in place");
+
+        app.lib_activate(0);
+        assert_eq!(titles(&app), ["A", "B", "nope"]);
+        assert_eq!(app.lib.levels, vec![0, 0, 1]);
+        assert!(!app.lib.view.table.rows[0].open);
+        assert!(app.lib.expanded.get(&page.key()).is_some_and(|s| s.contains("b") && !s.contains("a")));
+    }
+
+    #[test]
+    fn arrow_keys_expand_collapse_and_select_the_parent() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page;
+        let mut items = vec![Item::folder("a", "Album")];
+        items.extend((0..30).map(|i| track(&format!("t{i}"), &format!("T{i}"))));
+        app.lib.cache.insert(app.lib.page.key(), Listing::of(items));
+        app.lib.cache.insert(list_key("plex", "a"), Listing::of(vec![track("in", "Inside")]));
+        app.lib_show();
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib.anchor = Some(0);
+
+        assert!(app.lib_key(&Key::Named(NamedKey::ArrowRight), None));
+        assert_eq!(app.lib.items[1].title, "Inside");
+        assert_eq!(app.lib.levels[1], 1);
+
+        app.lib.view.table.selected = BTreeSet::from([1]);
+        app.lib.anchor = Some(1);
+        app.lib.view.table.top = 10;
+        assert!(app.lib_key(&Key::Named(NamedKey::ArrowLeft), None));
+        assert!(app.lib.view.table.selected.contains(&0));
+        let top = app.lib.view.table.top;
+        let vis = app.lib.view.visible_rows();
+        assert_eq!(top, 0, "the parent is scrolled into view");
+        assert!(vis > 0);
+        assert_eq!(app.lib.items[1].title, "Inside", "left on a child selects the parent and leaves it open");
+
+        assert!(app.lib_key(&Key::Named(NamedKey::ArrowLeft), None));
+        assert_eq!(app.lib.items[1].title, "T0");
+        assert_eq!(app.lib.levels, vec![0; app.lib.items.len()]);
+    }
+
+    #[test]
+    fn play_on_a_folder_waits_for_its_listing_and_sends_one_level() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("alb", "Abbey Road")]));
+        app.lib_show();
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("play");
+        let key = list_key("plex", "alb");
+        assert_eq!(app.lib.pending_play, Some((key.clone(), false)));
+        assert_eq!(app.lib.view.status, "Loading…");
+        assert!(app.playlist.entries.is_empty());
+
+        app.lib.cache.insert(list_key("plex", "sub"), Listing::of(vec![track("deep", "Deep")]));
+        app.lib_listing(key, Ok(Listing::of(vec![track("song", "Surface"), Item::folder("sub", "Sub")])));
+        assert!(app.lib.pending_play.is_none());
+        assert_eq!(app.playlist.entries.len(), 1);
+        assert_eq!(app.playlist.entries[0].title, "Surface");
+    }
+
+    #[test]
+    fn double_clicking_a_folder_does_not_drill_in() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.trail.push(Page::Settings);
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("alb", "Abbey Road")]));
+        app.lib_show();
+        let trail = app.lib.trail.clone();
+        app.lib_activate(0);
+        assert_eq!(app.lib.page, page);
+        assert_eq!(app.lib.trail, trail);
+        assert!(app.lib.expanded.get(&page.key()).is_some_and(|s| s.contains("alb")));
+        assert_eq!(app.lib.items[1].kind, "loading");
+    }
+
+    #[test]
+    fn a_listing_above_keeps_the_selection_on_the_same_row() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("a", "A"), track("c", "C")]));
+        app.lib_show();
+        let c = app.lib.items.iter().position(|i| i.id == "c").unwrap();
+        app.lib.view.table.selected = BTreeSet::from([c]);
+        app.lib.anchor = Some(c);
+        app.lib.view.table.top = 0;
+
+        // Open A above C, then its listing arrives and pushes C down.
+        app.lib.expanded.entry(page.key()).or_default().insert("a".into());
+        app.lib_show();
+        let c = app.lib.items.iter().position(|i| i.id == "c").unwrap();
+        assert_eq!(app.lib.view.table.selected, BTreeSet::from([c]));
+        assert_eq!(app.lib.anchor, Some(c));
+
+        let kids: Vec<Item> = (0..20).map(|i| track(&format!("k{i}"), &format!("K{i}"))).collect();
+        app.lib_listing(list_key("plex", "a"), Ok(Listing::of(kids)));
+        let c = app.lib.items.iter().position(|i| i.id == "c").unwrap();
+        assert_eq!(app.lib.items[c].title, "C");
+        assert_eq!(app.lib.view.table.selected, BTreeSet::from([c]));
+        assert_eq!(app.lib.anchor, Some(c));
+        let top = app.lib.view.table.top;
+        let vis = app.lib.view.visible_rows();
+        assert!(top <= c && c < top + vis, "the anchor stays on screen");
+    }
+
+    #[test]
+    fn a_failed_folder_retries_when_opened_again() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("a", "A")]));
+        app.lib_show();
+        let key = list_key("plex", "a");
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib.anchor = Some(0);
+        assert!(app.lib_key(&Key::Named(NamedKey::ArrowRight), None));
+        assert!(app.lib.inflight.contains(&key));
+        app.lib_listing(key.clone(), Err("nope".into()));
+        assert_eq!(app.lib.items[1].kind, "note");
+        assert!(!app.lib.inflight.contains(&key));
+
+        assert!(app.lib_key(&Key::Named(NamedKey::ArrowLeft), None));
+        assert_eq!(app.lib.items.len(), 1);
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib.anchor = Some(0);
+        assert!(app.lib_key(&Key::Named(NamedKey::ArrowRight), None));
+        assert!(app.lib.inflight.contains(&key), "opening the folder asks again");
+        assert_eq!(app.lib.items[1].kind, "loading");
+        assert_eq!(app.lib.items[1].title, "Loading…");
+        assert!(!app.lib.failed.contains_key(&key));
+
+        app.lib_listing(key.clone(), Err("again".into()));
+        assert_eq!(app.lib.items[1].kind, "note");
+        app.lib_open(page, false);
+        assert!(app.lib.inflight.contains(&key), "opening the page asks again");
+        assert!(app.lib.items.iter().any(|i| i.kind == "loading" && i.title == "Loading…"));
+    }
+
+    #[test]
+    fn the_disclose_glyph_has_the_same_menu_as_the_row() {
+        use crate::app::Kind;
+        use gamp_ui::library_window::Hot;
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("a", "A")]));
+        app.lib_show();
+        app.lib.hots = vec![(Hot::Row(0), (0, 0, 200, 15)), (Hot::Disclose(0), (4, 0, 12, 15))];
+        app.wins.get_mut(&Kind::Library).unwrap().cursor = (160, 4);
+        let on_row = menu_ids(app.lib_row_menu());
+        app.wins.get_mut(&Kind::Library).unwrap().cursor = (6, 4);
+        let on_glyph = menu_ids(app.lib_row_menu());
+        assert_eq!(on_glyph, on_row);
+        assert!(on_glyph.iter().any(|id| id == "lib:open"));
+    }
+
+    #[test]
+    fn fillers_are_left_out_of_the_count_and_a_folder_keeps_its_count() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("a", "A").items(Some(12)), track("song", "Song").secs(Some(7200.0))]));
+        app.lib.expanded.entry(page.key()).or_default().insert("a".into());
+        app.lib_show();
+        assert_eq!(app.lib.items[1].kind, "loading");
+        assert_eq!(app.lib.view.status, "2 items · 2.0 h");
+        assert_eq!(app.lib.view.table.columns.last().unwrap().0, "Length");
+        assert_eq!(app.lib.view.table.rows[0].cells.last().map(String::as_str), Some("12"));
+    }
+
+    #[test]
+    fn a_child_listing_does_not_take_a_pending_stream() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("a", "A")]));
+        app.lib.expanded.entry(page.key()).or_default().insert("a".into());
+        app.lib_show();
+        app.pending_stream = true;
+        app.lib_listing(list_key("plex", "a"), Ok(Listing::of(vec![track("child", "Child")])));
+        assert!(app.pending_stream);
+        assert!(app.playlist.entries.is_empty());
+        app.lib_listing(page.key(), Ok(Listing::of(vec![track("page", "PageSong")])));
+        assert!(!app.pending_stream);
+        assert_eq!(app.playlist.entries.len(), 1);
+        assert_eq!(app.playlist.entries[0].title, "PageSong");
+    }
 
     fn tone(path: &std::path::Path) {
         let rate = 22050u32;

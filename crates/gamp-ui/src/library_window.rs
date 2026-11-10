@@ -39,6 +39,8 @@ pub enum Hot {
     Search,
     Header(usize),
     Row(usize),
+    /// The +/− on a folder row. Drawn after `Row`, so a reverse hit-test prefers it.
+    Disclose(usize),
     Scroll,
     Button(String),
     Form(String),
@@ -132,6 +134,10 @@ pub struct Row {
     pub folder: bool,
     pub dim: bool,
     pub tip: String,
+    /// Tree indent, in steps of 12px.
+    pub depth: u8,
+    /// Folder is expanded. Closed folders draw `+`, open ones `−`.
+    pub open: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -467,6 +473,14 @@ fn row(frame: &mut Frame, skin: &Skin, at: (i32, i32, i32), items: &[W], pressed
     h + 5
 }
 
+/// The column that carries the row's name (everything else is metadata).
+fn title_at(columns: &[(String, f32)]) -> usize {
+    columns
+        .iter()
+        .position(|(n, _)| !matches!(n.as_str(), "Artist" | "Genre" | "Album" | "Format" | "File" | "Length" | "Items" | "Posted" | "Plays" | "Likes"))
+        .unwrap_or(0)
+}
+
 // ---- the window ------------------------------------------------------------------
 
 pub fn draw(frame: &mut Frame, skin: &Skin, v: &View) -> Vec<(Hot, R)> {
@@ -582,15 +596,40 @@ pub fn draw(frame: &mut Frame, skin: &Skin, v: &View) -> Vec<(Hot, R)> {
             frame.fill(r.0, r.1, r.2, r.3, argb(st.selected_bg));
         }
         let col = if v.table.selected.contains(&i) { st.current } else if row.dim { mix(st.normal, st.normal_bg, 0.45) } else { st.normal };
-        for (c, (x, cw)) in col_x.iter().enumerate() {
-            let mut text = row.cells.get(c).cloned().unwrap_or_default();
-            if c == 0 && row.folder {
-                text = format!("+ {text}");
+        if row.folder {
+            // Glyph and title span the row; the count stays in the last column.
+            let indent = row.depth as i32 * 12;
+            let glyph = if row.open { "\u{2212}" } else { "+" };
+            let gx = r.0 + 4 + indent;
+            let gw = font::measure(glyph, PX, true).max(1);
+            font::draw(frame, gx, y + 11, glyph, PX, col, gw + 2, true);
+            let title_idx = title_at(&v.table.columns);
+            let title = row.cells.get(title_idx).map(String::as_str).unwrap_or("");
+            let last = row.cells.len().saturating_sub(1);
+            let count = if row.cells.len() > 1 && last != title_idx { row.cells[last].as_str() } else { "" };
+            let (lx, lw) = col_x.last().copied().unwrap_or((r.0, r.2));
+            let count_w = if count.is_empty() { 0 } else { font::measure(count, PX, false) };
+            let count_x = lx + lw - count_w - 4;
+            let title_x = gx + gw + 4;
+            let title_end = if count.is_empty() { r.0 + r.2 - 4 } else { count_x - 6 };
+            let title_w = (title_end - title_x).max(0);
+            let title = font::ellipsize(title, PX, title_w, true);
+            font::draw(frame, title_x, y + 11, &title, PX, col, title_w, true);
+            if !count.is_empty() {
+                font::draw(frame, count_x, y + 11, count, PX, col, count_w.max(1), false);
             }
-            let text = font::ellipsize(&text, PX, cw - 6, false);
-            font::draw(frame, x + 4, y + 11, &text, PX, col, cw - 6, row.folder && c == 0);
+            hots.push((Hot::Row(i), r));
+            hots.push((Hot::Disclose(i), (gx, y, gw + 2, ROW)));
+        } else {
+            for (c, (x, cw)) in col_x.iter().enumerate() {
+                let text = row.cells.get(c).map(String::as_str).unwrap_or("");
+                let extra = if c == 0 { row.depth as i32 * 12 } else { 0 };
+                let room = (cw - 6 - extra).max(0);
+                let text = font::ellipsize(text, PX, room, false);
+                font::draw(frame, x + 4 + extra, y + 11, &text, PX, col, room, false);
+            }
+            hots.push((Hot::Row(i), r));
         }
-        hots.push((Hot::Row(i), r));
     }
     if v.table.rows.is_empty() && !v.table.empty.is_empty() {
         for (n, line) in wrap(&shown(&v.table.empty), t.2 - 20).iter().enumerate() {
@@ -736,5 +775,26 @@ mod tests {
         if let Ok(dir) = std::env::var("GAMP_SNAPSHOTS") {
             f.to_image().save(format!("{dir}/library-form.png")).unwrap();
         }
+    }
+
+    #[test]
+    fn an_open_folder_discloses_on_its_glyph() {
+        let skin = Skin::default_skin();
+        let mut v = View { width: 560, height: 348, ..Default::default() };
+        v.table.columns = vec![("Name".into(), 3.0), ("Items".into(), 0.7)];
+        v.table.rows = vec![
+            Row { cells: vec!["Artists".into(), "2".into()], folder: true, open: true, depth: 0, ..Default::default() },
+            Row { cells: vec!["Beatles".into(), "12".into()], folder: true, open: false, depth: 1, ..Default::default() },
+        ];
+        let mut f = Frame::new(1, 1);
+        let hots = draw(&mut f, &skin, &v);
+        let rect = |hot: Hot| hots.iter().find(|(h, _)| *h == hot).map(|(_, r)| *r).unwrap();
+        let parent = rect(Hot::Disclose(0));
+        let glyph = rect(Hot::Disclose(1));
+        let row = rect(Hot::Row(1));
+        assert_eq!(glyph.0, parent.0 + 12, "a depth-1 glyph sits 12px in from its parent");
+        let hit = |x: i32, y: i32| hots.iter().rev().find(|(_, r)| inside(*r, x, y)).map(|(h, _)| h.clone());
+        assert_eq!(hit(glyph.0 + 1, glyph.1 + ROW / 2), Some(Hot::Disclose(1)));
+        assert_eq!(hit(row.0 + row.2 - 2, row.1 + ROW / 2), Some(Hot::Row(1)));
     }
 }

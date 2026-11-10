@@ -2382,6 +2382,7 @@ impl App {
             "drop:cycle" => self.drop_cycle(!self.drop.engine.auto),
             "lib:play" => self.lib_button("play"),
             "lib:enqueue" => self.lib_button("enqueue"),
+            "lib:open" => self.lib_open_folder(),
             "lib:artist" => self.lib_artist(),
             "lib:fav" => self.lib_button("action:fav:add"),
             "pl:fav" => self.pl_favorite(),

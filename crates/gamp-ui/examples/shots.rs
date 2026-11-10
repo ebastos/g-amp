@@ -106,4 +106,17 @@ fn main() {
     lib.status = "19 items".into();
     lw::draw(&mut f, &skin, &lib);
     save(&f, format!("{dir}/library.png"));
+
+    lib.table.columns = vec![("Name".into(), 3.0), ("Artist".into(), 2.0), ("Items".into(), 0.7)];
+    lib.table.rows = vec![
+        Row { cells: vec!["The Beatles".into(), String::new(), "2".into()], folder: true, open: true, ..Default::default() },
+        Row { cells: vec!["Abbey Road".into(), "The Beatles".into(), "17".into()], folder: true, depth: 1, ..Default::default() },
+        Row { cells: vec!["Let It Be".into(), "The Beatles".into(), "12".into()], folder: true, open: true, depth: 1, ..Default::default() },
+        Row { cells: vec!["Two of Us".into(), "The Beatles".into(), String::new()], depth: 2, ..Default::default() },
+    ];
+    lib.table.selected.clear();
+    lib.table.selected.insert(1);
+    lib.status = "4 items".into();
+    lw::draw(&mut f, &skin, &lib);
+    save(&f, format!("{dir}/library-expanded.png"));
 }
