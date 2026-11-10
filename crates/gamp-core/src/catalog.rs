@@ -20,10 +20,14 @@ pub struct Source {
     pub search: bool,
     /// Needs connecting in Settings first.
     pub needs_setup: bool,
+    /// Left out of the library tree.
+    pub hidden: bool,
+    /// A saved account the user can remove (not DLNA, cloud folders, or a built-in).
+    pub removable: bool,
 }
 
 pub async fn sources() -> Vec<Source> {
-    let mut out = vec![Source { id: "local".into(), name: "Local Media".into(), group: "local".into(), roots: vec![("audio".into(), "Audio".into())], search: false, needs_setup: false }];
+    let mut out = vec![Source { id: "local".into(), name: "Local Media".into(), group: "local".into(), roots: vec![("audio".into(), "Audio".into())], search: false, needs_setup: false, hidden: false, removable: false }];
     for v in sources::list().await.as_array().cloned().unwrap_or_default() {
         out.push(Source {
             id: s(&v["id"]),
@@ -32,11 +36,13 @@ pub async fn sources() -> Vec<Source> {
             roots: arr(&v["roots"]).iter().map(|r| (s(&r["id"]), s(&r["title"]))).collect(),
             search: v["search"] == true,
             needs_setup: false,
+            hidden: v["hidden"] == true,
+            removable: v["removable"] == true,
         });
     }
     // Dropbox, Google Drive and OneDrive, through their desktop apps' folders.
     for f in crate::cloud::folders() {
-        out.push(Source { id: f.id, name: f.name, group: "network".into(), roots: vec![("files".into(), "Files".into())], search: false, needs_setup: false });
+        out.push(Source { id: f.id, name: f.name, group: "network".into(), roots: vec![("files".into(), "Files".into())], search: false, needs_setup: false, hidden: false, removable: false });
     }
     let sc = !crate::store::config().await.soundcloud_profile.is_empty();
     out.push(Source {
@@ -47,6 +53,8 @@ pub async fn sources() -> Vec<Source> {
         // Links and search work without an account.
         search: true,
         needs_setup: !sc,
+        hidden: false,
+        removable: false,
     });
     let sp = spotify::connected().await;
     out.push(Source {
@@ -56,6 +64,8 @@ pub async fn sources() -> Vec<Source> {
         roots: if sp { vec![("liked".into(), "Liked Songs".into()), ("playlists".into(), "Playlists".into())] } else { vec![] },
         search: sp,
         needs_setup: !sp,
+        hidden: false,
+        removable: false,
     });
     out.push(Source {
         id: "skins".into(),
@@ -64,6 +74,8 @@ pub async fn sources() -> Vec<Source> {
         roots: vec![("popular".into(), "Most popular".into())],
         search: true,
         needs_setup: false,
+        hidden: false,
+        removable: false,
     });
     out
 }

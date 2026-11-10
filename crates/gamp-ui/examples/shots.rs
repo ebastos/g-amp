@@ -77,7 +77,7 @@ fn main() {
         ("Podcasts", 1, true), ("Internet Archive", 1, true),
         ("SoundCloud", 0, true), ("Spotify", 0, true),
     ];
-    lib.tree = tree.iter().map(|(l, d, g)| TreeRow { label: (*l).into(), depth: *d, group: *g, open: true, selected: *l == "Top Stations" }).collect();
+    lib.tree = tree.iter().map(|(l, d, g)| TreeRow { label: (*l).into(), depth: *d, group: *g, open: true, selected: *l == "Top Stations", dim: false }).collect();
     lib.table.columns = vec![("Station".into(), 3.0), ("Genre".into(), 2.0), ("Format".into(), 1.1)];
     let stations = [
         ("SomaFM Groove Salad", "ambient, chillout, downtempo", "MP3 128 kbps"),

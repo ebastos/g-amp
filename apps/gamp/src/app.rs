@@ -2232,7 +2232,7 @@ impl App {
         }
     }
 
-    fn open_menu(&mut self, items: Vec<Item>, at: (i32, i32), el: Option<&ActiveEventLoop>) {
+    pub(crate) fn open_menu(&mut self, items: Vec<Item>, at: (i32, i32), el: Option<&ActiveEventLoop>) {
         self.close_menus();
         self.push_menu(items, at, el);
     }
@@ -2314,7 +2314,7 @@ impl App {
         }
     }
 
-    pub fn menu_action(&mut self, id: &str, _el: Option<&ActiveEventLoop>) {
+    pub fn menu_action(&mut self, id: &str, el: Option<&ActiveEventLoop>) {
         match id {
             "about" => self.main.message = Some(format!("GAMP {} - FILLINTHE/G-AMP", env!("CARGO_PKG_VERSION"))),
             "report" => {
@@ -2381,6 +2381,9 @@ impl App {
             "drop:random" => self.drop_step(|e| e.random(false)),
             "drop:cycle" => self.drop_cycle(!self.drop.engine.auto),
             "lib:play" => self.lib_button("play"),
+            id if id.starts_with("lib:tree:") => {
+                let _ = self.lib_tree_action(id, el);
+            }
             "lib:enqueue" => self.lib_button("enqueue"),
             "lib:open" => self.lib_open_folder(),
             "lib:artist" => self.lib_artist(),

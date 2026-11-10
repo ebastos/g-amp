@@ -2,7 +2,7 @@
 //! double size, always on top, equalizer, volume, balance, shuffle,
 //! repeat, the playlist and its current song, the skin, G-Drop's preset.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,12 @@ pub struct Session {
     pub position: f64,
     /// The library's recent searches, by source.
     pub searches: HashMap<String, Vec<String>>,
+    /// Library groups that start open and were closed.
+    #[serde(default)]
+    pub collapsed: BTreeSet<String>,
+    /// Library groups that start closed (a server, DLNA) and were opened.
+    #[serde(default)]
+    pub opened: BTreeSet<String>,
     /// The language picked in Options › Language (none: the system's).
     pub lang: Option<String>,
 }
@@ -128,6 +134,8 @@ impl App {
             shade: (self.main.shade, self.eq.shade, self.pl.shade),
             position: self.resume_point(),
             searches: self.lib.recent.clone(),
+            collapsed: self.lib.collapsed.clone(),
+            opened: self.lib.opened.clone(),
             lang: self.lang.clone(),
         };
         if let Ok(json) = serde_json::to_vec_pretty(&s) {
@@ -162,6 +170,8 @@ impl App {
         self.player.set_eq(gamp_audio::EqSettings { on: s.eq_on, preamp: s.preamp, bands: s.bands });
         self.main.show_remaining = s.time_remaining;
         self.lib.recent = s.searches.clone();
+        self.lib.collapsed = s.collapsed.clone();
+        self.lib.opened = s.opened.clone();
         self.set_lang(s.lang.clone());
         self.main.vis_mode = match s.vis_mode {
             1 => gamp_ui::vis::VisMode::Oscilloscope,

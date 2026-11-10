@@ -60,6 +60,8 @@ pub struct Config {
     pub soundcloud_user: u64,
     /// Your Dropbox app's key (Dropbox gives every app its own).
     pub dropbox_key: String,
+    /// Source ids left out of the library tree (a DLNA server you hid).
+    pub hidden_sources: Vec<String>,
 }
 
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();

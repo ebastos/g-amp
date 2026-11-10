@@ -178,6 +178,21 @@ impl Backend {
         });
     }
 
+    /// The saved account's display name, then the source list again.
+    /// The tree menu grows a Rename item in a later phase; nothing calls this yet.
+    #[allow(dead_code)]
+    pub fn rename(&self, id: String, name: String) {
+        let tx = self.tx.clone();
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let _ = gamp_core::sources::rename(&id, &name).await;
+            let _ = tx.send(Reply::Sources(catalog::sources().await));
+            if let Some(p) = proxy {
+                let _ = p.send_event(UserEvent::Wake);
+            }
+        });
+    }
+
     pub fn rescan(&self) {
         self.spawn(async { Reply::Scan(gamp_core::library::rescan().await) });
     }

@@ -35,6 +35,8 @@ pub enum Hot {
     Close,
     Resize,
     Tree(usize),
+    /// The +/− on a group row. Drawn after `Tree`, so a reverse hit-test prefers it.
+    TreeToggle(usize),
     Back,
     Search,
     Header(usize),
@@ -126,6 +128,8 @@ pub struct TreeRow {
     pub group: bool,
     pub open: bool,
     pub selected: bool,
+    /// Mixed toward the background (a server that isn't answering), unless selected.
+    pub dim: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -516,11 +520,32 @@ pub fn draw(frame: &mut Frame, skin: &Skin, v: &View) -> Vec<(Hot, R)> {
             frame.fill(r.0, r.1, r.2, r.3, argb(st.selected_bg));
         }
         let indent = 4 + t.depth as i32 * 10;
-        let col = if t.group || t.selected { st.current } else { st.normal };
-        let label = if t.group { format!("{} {}", if t.open { "−" } else { "+" }, shown(&t.label)) } else { format!("› {}", shown(&t.label)) };
-        let label = font::ellipsize(&label, PX, tree.2 - indent - 2, t.group);
-        font::draw(frame, r.0 + indent, y + 11, &label, PX, col, tree.2 - indent - 2, t.group && t.depth == 0);
-        hots.push((Hot::Tree(i), r));
+        let col = if t.selected {
+            st.current
+        } else if t.dim {
+            mix(st.normal, st.normal_bg, 0.45)
+        } else if t.group {
+            st.current
+        } else {
+            st.normal
+        };
+        let bold = t.group && t.depth == 0;
+        if t.group {
+            let glyph = if t.open { "−" } else { "+" };
+            let gx = r.0 + indent;
+            let gw = font::measure(glyph, PX, bold).max(1);
+            font::draw(frame, gx, y + 11, glyph, PX, col, gw + 2, bold);
+            let label_x = gx + gw + font::measure(" ", PX, bold).max(1);
+            let room = (tree.0 + tree.2 - label_x - 2).max(0);
+            let label = font::ellipsize(&shown(&t.label), PX, room, bold);
+            font::draw(frame, label_x, y + 11, &label, PX, col, room, bold);
+            hots.push((Hot::Tree(i), r));
+            hots.push((Hot::TreeToggle(i), (gx, y, gw + 2, ROW)));
+        } else {
+            let label = font::ellipsize(&format!("› {}", shown(&t.label)), PX, tree.2 - indent - 2, false);
+            font::draw(frame, r.0 + indent, y + 11, &label, PX, col, tree.2 - indent - 2, false);
+            hots.push((Hot::Tree(i), r));
+        }
     }
 
     // The toolbar: back, crumb, search.
@@ -796,5 +821,27 @@ mod tests {
         let hit = |x: i32, y: i32| hots.iter().rev().find(|(_, r)| inside(*r, x, y)).map(|(h, _)| h.clone());
         assert_eq!(hit(glyph.0 + 1, glyph.1 + ROW / 2), Some(Hot::Disclose(1)));
         assert_eq!(hit(row.0 + row.2 - 2, row.1 + ROW / 2), Some(Hot::Row(1)));
+    }
+
+    #[test]
+    fn a_group_row_toggles_on_its_glyph_and_the_label_is_the_row() {
+        let skin = Skin::default_skin();
+        let mut v = View { width: 560, height: 348, ..Default::default() };
+        v.tree = vec![
+            TreeRow { label: "Network & Cloud".into(), group: true, open: true, depth: 0, ..Default::default() },
+            TreeRow { label: "Navidrome · offline".into(), group: true, open: false, depth: 1, dim: true, ..Default::default() },
+        ];
+        let mut f = Frame::new(1, 1);
+        let hots = draw(&mut f, &skin, &v);
+        let rect = |hot: Hot| hots.iter().find(|(h, _)| *h == hot).map(|(_, r)| *r).unwrap();
+        let glyph = rect(Hot::TreeToggle(0));
+        let row = rect(Hot::Tree(0));
+        let nested = rect(Hot::TreeToggle(1));
+        let hit = |x: i32, y: i32| hots.iter().rev().find(|(_, r)| inside(*r, x, y)).map(|(h, _)| h.clone());
+        assert_eq!(hit(glyph.0 + 1, glyph.1 + ROW / 2), Some(Hot::TreeToggle(0)));
+        assert_eq!(hit(row.0 + row.2 - 2, row.1 + ROW / 2), Some(Hot::Tree(0)));
+        assert!(nested.0 > glyph.0, "a nested group's glyph sits in from its parent");
+        assert_eq!(hit(nested.0 + 1, nested.1 + ROW / 2), Some(Hot::TreeToggle(1)));
+        assert_eq!(hit(rect(Hot::Tree(1)).0 + 2, nested.1 + ROW / 2), Some(Hot::Tree(1)));
     }
 }

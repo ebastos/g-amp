@@ -436,9 +436,24 @@ pub async fn add(new: NewAccount) -> Result<Value, ApiError> {
         Kind::Webdav => webdav::connect(&mut acc).await?,
         _ => return Err(err(StatusCode::BAD_REQUEST, "That kind of source is added another way")),
     }
-    let info = info(&acc);
+    let info = info(&acc, false);
     save_account(acc).await?;
     Ok(info)
+}
+
+/// The saved account's display name. A blank name is refused; a source that
+/// isn't a saved account (DLNA, radio) isn't there to rename.
+pub async fn rename(id: &str, name: &str) -> Result<Value, ApiError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Type a name"));
+    }
+    let mut acc = accounts().await.into_iter().find(|a| a.id == id).ok_or_else(|| not_found("That source"))?;
+    acc.name = name.to_owned();
+    let hidden = store::config().await.hidden_sources.iter().any(|h| h == &acc.id);
+    let body = info(&acc, hidden);
+    save_account(acc).await?;
+    Ok(body)
 }
 
 // ---- what the page sees ------------------------------------------------
@@ -468,7 +483,7 @@ fn searchable(kind: Kind) -> bool {
     !matches!(kind, Kind::Webdav | Kind::Dlna)
 }
 
-fn info(acc: &Account) -> Value {
+fn info(acc: &Account, hidden: bool) -> Value {
     let group = match acc.kind {
         Kind::Radio | Kind::Podcasts | Kind::Archive | Kind::Audius => "internet",
         _ => "network",
@@ -481,6 +496,7 @@ fn info(acc: &Account) -> Value {
         "address": if acc.kind == Kind::Dropbox { acc.username.clone() } else { acc.url.clone() },
         "group": group,
         "removable": !matches!(acc.kind, Kind::Radio | Kind::Podcasts | Kind::Archive | Kind::Audius | Kind::Dlna),
+        "hidden": hidden,
         "roots": roots(acc.kind),
         "search": searchable(acc.kind),
     })
@@ -488,10 +504,12 @@ fn info(acc: &Account) -> Value {
 
 pub async fn list() -> Value {
     dlna::refresh_soon();
-    let mut out: Vec<Value> = accounts().await.iter().map(info).collect();
-    out.extend(dlna::servers().iter().map(info));
+    let hidden = store::config().await.hidden_sources;
+    let mark = |acc: &Account| info(acc, hidden.iter().any(|h| h == &acc.id));
+    let mut out: Vec<Value> = accounts().await.iter().map(mark).collect();
+    out.extend(dlna::servers().iter().map(mark));
     for k in [Kind::Radio, Kind::Podcasts, Kind::Archive, Kind::Audius] {
-        out.push(info(&Account::builtin(k)));
+        out.push(mark(&Account::builtin(k)));
     }
     Value::Array(out)
 }
@@ -800,6 +818,24 @@ mod tests {
         assert_eq!(own_media_path("http://localhost:9000/media/spotify/x.ogg").as_deref(), Some("/media/spotify/x.ogg"));
         assert_eq!(own_media_path("http://127.0.0.1:8742/api/x"), None);
         assert_eq!(own_media_path("http://example.com/media/x"), None);
+    }
+
+    #[tokio::test]
+    async fn rename_updates_a_saved_account_and_refuses_a_blank_name() {
+        store::init(std::env::temp_dir().join(format!("gamp-rename-{}", std::process::id())), None);
+        let id = format!("plex-{}", random_hex(4));
+        save_account(Account { id: id.clone(), kind: Kind::Plex, name: "Old Name".into(), url: "http://nas:32400".into(), ..Default::default() }).await.unwrap();
+        assert!(rename(&id, "  ").await.is_err());
+        let still = accounts().await.into_iter().find(|a| a.id == id).unwrap();
+        assert_eq!(still.name, "Old Name");
+        let v = rename(&id, "  Living Room ").await.unwrap();
+        assert_eq!(v["name"], "Living Room");
+        assert_eq!(v["hidden"], false);
+        assert_eq!(v["removable"], true);
+        assert!(rename("no-such-source", "X").await.is_err());
+        let saved = accounts().await.into_iter().find(|a| a.id == id).unwrap();
+        assert_eq!(saved.name, "Living Room");
+        remove_account(&id).await.unwrap();
     }
 
     #[test]

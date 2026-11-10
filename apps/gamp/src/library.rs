@@ -26,7 +26,8 @@ const RECENT_KIND: &str = "search";
 /// What a tree row opens.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
-    Toggle(String),
+    /// A group row. `sid` is set for a server (`src:<sid>`).
+    Group { key: String, sid: Option<String> },
     Open { sid: String, node: String, title: String },
     Search { sid: String, title: String },
     /// A recent search, run again.
@@ -66,7 +67,14 @@ pub struct LibState {
     pub hots: Vec<(Hot, lw::R)>,
     pub sources: Vec<Source>,
     pub targets: Vec<Target>,
+    /// Groups that start open (Local Media, Network & Cloud, …) and are closed.
     pub collapsed: BTreeSet<String>,
+    /// Groups that start closed (a server, the DLNA group) and are open.
+    pub opened: BTreeSet<String>,
+    /// A network source whose last listing failed: sid → the error.
+    pub offline: HashMap<String, String>,
+    /// Where the tree menu was opened, so Remove… can confirm in the same place.
+    pub menu_at: (i32, i32),
     pub page: Page,
     pub trail: Vec<Page>,
     pub cache: HashMap<String, Listing>,
@@ -120,6 +128,9 @@ impl Default for LibState {
             sources: Vec::new(),
             targets: Vec::new(),
             collapsed: BTreeSet::new(),
+            opened: BTreeSet::new(),
+            offline: HashMap::new(),
+            menu_at: (0, 0),
             page: Page::List { sid: "local".into(), node: "audio".into(), title: "Local Media › Audio".into() },
             trail: Vec::new(),
             cache: HashMap::new(),
@@ -160,6 +171,99 @@ fn is_filler(i: &Item) -> bool {
 
 fn list_key(sid: &str, node: &str) -> String {
     format!("{sid}\u{1f}{node}")
+}
+
+fn listing_sid(key: &str) -> &str {
+    key.split('\u{1f}').next().unwrap_or("")
+}
+
+/// A server subgroup and the DLNA group start closed. Everything else starts open.
+fn group_starts_closed(key: &str) -> bool {
+    key.starts_with("src:") || key == "dlna"
+}
+
+fn group_is_open(key: &str, collapsed: &BTreeSet<String>, opened: &BTreeSet<String>) -> bool {
+    if group_starts_closed(key) { opened.contains(key) } else { !collapsed.contains(key) }
+}
+
+/// A saved account can be removed. Cloud folders and anything marked not removable stay.
+fn can_remove(s: &Source) -> bool {
+    s.removable && !s.id.starts_with("cloud-")
+}
+
+enum TreeCmd {
+    Open(String),
+    Refresh(String),
+    Hide(String),
+    /// Asks first. Does not delete.
+    Confirm(String),
+    Remove(String),
+    Manage,
+    Cancel,
+}
+
+fn tree_cmd(id: &str) -> Option<TreeCmd> {
+    if id == "lib:tree:manage" {
+        return Some(TreeCmd::Manage);
+    }
+    if id == "lib:tree:cancel" {
+        return Some(TreeCmd::Cancel);
+    }
+    let rest = id.strip_prefix("lib:tree:")?;
+    // `remove!` before `remove`, so the confirm id is not read as the ask.
+    let (kind, sid) = if let Some(sid) = rest.strip_prefix("remove!:") {
+        ("remove!", sid)
+    } else {
+        rest.split_once(':')?
+    };
+    if sid.is_empty() {
+        return None;
+    }
+    let sid = sid.to_owned();
+    Some(match kind {
+        "open" => TreeCmd::Open(sid),
+        "refresh" => TreeCmd::Refresh(sid),
+        "hide" => TreeCmd::Hide(sid),
+        "remove" => TreeCmd::Confirm(sid),
+        "remove!" => TreeCmd::Remove(sid),
+        _ => return None,
+    })
+}
+
+fn source_menu(s: &Source) -> Vec<gamp_ui::menu::Item> {
+    use gamp_ui::menu::Item as M;
+    let mut menu = vec![M::action(format!("lib:tree:open:{}", s.id), "Open"), M::action(format!("lib:tree:refresh:{}", s.id), "Refresh")];
+    if s.id.starts_with("dlna-") {
+        menu.push(M::action(format!("lib:tree:hide:{}", s.id), "Hide"));
+    }
+    if can_remove(s) {
+        menu.push(M::action(format!("lib:tree:remove:{}", s.id), "Remove…"));
+    }
+    menu.push(M::action("lib:tree:manage", "Manage Network & Cloud…"));
+    menu
+}
+
+/// The confirm step for Remove…. Only `lib:tree:remove!:` deletes.
+fn lib_remove_confirm(name: &str, sid: &str) -> Vec<gamp_ui::menu::Item> {
+    use gamp_ui::menu::Item as M;
+    vec![M::action(format!("lib:tree:remove!:{sid}"), tf("Remove {}", &[&name])), M::action("lib:tree:cancel", "Cancel")]
+}
+
+fn tree_row_menu(targets: &[Target], sources: &[Source], i: usize) -> Option<Vec<gamp_ui::menu::Item>> {
+    use gamp_ui::menu::Item as M;
+    let t = targets.get(i)?;
+    match t {
+        Target::Group { key, .. } if key == "network" => Some(vec![M::action("lib:tree:manage", "Manage Network & Cloud…")]),
+        Target::Group { key, sid } if key.starts_with("src:") => {
+            let id = sid.as_deref().or_else(|| key.strip_prefix("src:"))?;
+            sources.iter().find(|s| s.id == id).map(source_menu)
+        }
+        Target::Open { sid, .. } | Target::Search { sid, .. } | Target::Recent { sid, .. } => {
+            let s = sources.iter().find(|s| s.id == *sid)?;
+            (s.group == "network" || s.group == "internet").then(|| source_menu(s))
+        }
+        _ => None,
+    }
 }
 
 fn item_text_has(i: &Item, filter: &str) -> bool {
@@ -301,14 +405,16 @@ impl App {
         let mut targets = Vec::new();
         let here = self.lib.trail.first().cloned().unwrap_or_else(|| self.lib.page.clone());
         let collapsed = self.lib.collapsed.clone();
+        let opened = self.lib.opened.clone();
+        let offline = self.lib.offline.clone();
         // The search being shown, if it's one of the recent ones: that row lights up, not Search.
         let query = self.lib.view.search.value.trim().to_owned();
         let recent = self.lib.recent.clone();
         let on_recent = |sid: &str| recent.get(sid).is_some_and(|r| r.contains(&query));
-        let group = |rows: &mut Vec<TreeRow>, targets: &mut Vec<Target>, key: &str, label: &str, depth: u8| -> bool {
-            let open = !collapsed.contains(key);
-            rows.push(TreeRow { label: label.into(), depth, group: true, open, selected: false });
-            targets.push(Target::Toggle(key.into()));
+        let group = |rows: &mut Vec<TreeRow>, targets: &mut Vec<Target>, key: &str, label: &str, depth: u8, sid: Option<&str>, dim: bool| -> bool {
+            let open = group_is_open(key, &collapsed, &opened);
+            rows.push(TreeRow { label: label.into(), depth, group: true, open, selected: false, dim });
+            targets.push(Target::Group { key: key.into(), sid: sid.map(str::to_owned) });
             open
         };
         let leaf = |rows: &mut Vec<TreeRow>, targets: &mut Vec<Target>, t: Target, label: &str, depth: u8| {
@@ -319,11 +425,11 @@ impl App {
                 (Target::Settings(None), Page::Settings) => true,
                 _ => false,
             };
-            rows.push(TreeRow { label: label.into(), depth, group: false, open: false, selected });
+            rows.push(TreeRow { label: label.into(), depth, group: false, open: false, selected, dim: false });
             targets.push(t);
         };
         leaf(&mut rows, &mut targets, Target::Open { sid: "favorites".into(), node: "favorites".into(), title: "Favorites".into() }, "Favorites", 0);
-        let src = self.lib.sources.clone();
+        let src: Vec<Source> = self.lib.sources.iter().filter(|s| !s.hidden).cloned().collect();
         let source_rows = |rows: &mut Vec<TreeRow>, targets: &mut Vec<Target>, s: &Source, depth: u8| {
             for (node, title) in &s.roots {
                 leaf(rows, targets, Target::Open { sid: s.id.clone(), node: node.clone(), title: format!("{} › {title}", s.name) }, title, depth);
@@ -340,32 +446,46 @@ impl App {
                 leaf(rows, targets, Target::Settings(Some(section)), "Connect…", depth);
             }
         };
+        let add_source = |rows: &mut Vec<TreeRow>, targets: &mut Vec<Target>, s: &Source, depth: u8| {
+            let key = format!("src:{}", s.id);
+            let dim = offline.contains_key(&s.id);
+            let label = if dim { format!("{}{}", s.name, t(" · offline")) } else { s.name.clone() };
+            if group(rows, targets, &key, &label, depth, Some(&s.id), dim) {
+                source_rows(rows, targets, s, depth + 1);
+            }
+        };
         if let Some(local) = src.iter().find(|s| s.id == "local") {
-            if group(&mut rows, &mut targets, "local", "Local Media", 0) {
+            if group(&mut rows, &mut targets, "local", "Local Media", 0, None, false) {
                 source_rows(&mut rows, &mut targets, local, 1);
             }
         }
-        if group(&mut rows, &mut targets, "network", "Network & Cloud", 0) {
+        if group(&mut rows, &mut targets, "network", "Network & Cloud", 0, None, false) {
             let network: Vec<&Source> = src.iter().filter(|s| s.group == "network").collect();
-            if network.is_empty() {
+            let (dlna, rest): (Vec<&Source>, Vec<&Source>) = network.into_iter().partition(|s| s.id.starts_with("dlna-"));
+            if rest.is_empty() && dlna.is_empty() {
                 leaf(&mut rows, &mut targets, Target::Settings(Some("Media servers")), "Add a server…", 1);
             }
-            for s in network {
-                if group(&mut rows, &mut targets, &format!("src:{}", s.id), &s.name, 1) {
-                    source_rows(&mut rows, &mut targets, s, 2);
+            for s in &rest {
+                add_source(&mut rows, &mut targets, s, 1);
+            }
+            if !dlna.is_empty() {
+                let n = dlna.len();
+                let label = tf("On this network ({})", &[&n]);
+                if group(&mut rows, &mut targets, "dlna", &label, 1, None, false) {
+                    for s in &dlna {
+                        add_source(&mut rows, &mut targets, s, 2);
+                    }
                 }
             }
         }
-        if group(&mut rows, &mut targets, "internet", "Internet", 0) {
+        if group(&mut rows, &mut targets, "internet", "Internet", 0, None, false) {
             for s in src.iter().filter(|s| s.group == "internet") {
-                if group(&mut rows, &mut targets, &format!("src:{}", s.id), &s.name, 1) {
-                    source_rows(&mut rows, &mut targets, s, 2);
-                }
+                add_source(&mut rows, &mut targets, s, 1);
             }
         }
         for id in ["soundcloud", "spotify", "skins"] {
             if let Some(s) = src.iter().find(|s| s.id == id) {
-                if group(&mut rows, &mut targets, id, &s.name, 0) {
+                if group(&mut rows, &mut targets, id, &s.name, 0, None, false) {
                     source_rows(&mut rows, &mut targets, s, 1);
                 }
             }
@@ -639,8 +759,14 @@ impl App {
     fn lib_listing(&mut self, key: String, result: Result<Listing, String>) {
         self.lib.loading = false;
         self.lib.inflight.remove(&key);
+        let sid = listing_sid(&key).to_owned();
+        let network = self.lib.sources.iter().any(|s| s.id == sid && s.group == "network");
+        let mut offline_changed = false;
         match result {
             Ok(l) => {
+                if network {
+                    offline_changed = self.lib.offline.remove(&sid).is_some();
+                }
                 // A child folder's listing must not eat a play that is waiting on this page.
                 let for_page = self.lib.page.key() == key;
                 let play_now = for_page && self.pending_stream && !l.items.is_empty() && l.items.iter().all(|i| i.live || i.url.is_some());
@@ -662,6 +788,10 @@ impl App {
                 }
             }
             Err(e) => {
+                if network {
+                    offline_changed = self.lib.offline.get(&sid).map(String::as_str) != Some(e.as_str());
+                    self.lib.offline.insert(sid, e.clone());
+                }
                 if self.lib.pending_play.as_ref().is_some_and(|(k, _)| k == &key) {
                     self.lib.pending_play = None;
                 }
@@ -677,6 +807,9 @@ impl App {
                 self.last_error = Some(e.clone());
                 self.lib.view.status = e;
             }
+        }
+        if offline_changed {
+            self.lib_tree();
         }
     }
 
@@ -791,21 +924,19 @@ impl App {
                 }
                 return;
             }
+            Hot::TreeToggle(i) => {
+                if let Some(Target::Group { key, .. }) = self.lib.targets.get(*i).cloned() {
+                    self.lib_toggle_group(&key);
+                }
+                return;
+            }
             Hot::Tree(i) => {
                 match self.lib.targets.get(*i).cloned() {
-                    Some(Target::Toggle(k)) => {
-                        if !self.lib.collapsed.remove(&k) {
-                            self.lib.collapsed.insert(k);
-                        }
-                        self.lib_tree();
-                    }
+                    Some(Target::Group { key, sid }) => self.lib_group_click(key, sid),
                     Some(Target::Open { sid, node, title }) => self.lib_open(Page::List { sid, node, title }, true),
                     Some(Target::Search { sid, title }) => self.lib_open(Page::Search { sid, title }, true),
                     Some(Target::Recent { sid, title, query }) => self.lib_search_again(sid, title, query),
-                    Some(Target::Settings(section)) => {
-                        self.lib_open(Page::Settings, true);
-                        self.lib.view.form_scroll = section.and_then(|p| lw::heading_scroll(&self.skin, &self.lib.view, p)).unwrap_or(0);
-                    }
+                    Some(Target::Settings(section)) => self.lib_open_settings(section),
                     None => {}
                 }
                 return;
@@ -1071,12 +1202,121 @@ impl App {
         }
     }
 
+    fn lib_toggle_group(&mut self, key: &str) {
+        let set = if group_starts_closed(key) { &mut self.lib.opened } else { &mut self.lib.collapsed };
+        if !set.remove(key) {
+            set.insert(key.to_owned());
+        }
+        self.lib_tree();
+    }
+
+    /// Settings, scrolled to a heading when one is named.
+    fn lib_open_settings(&mut self, section: Option<&'static str>) {
+        self.lib_open(Page::Settings, true);
+        self.lib.view.form_scroll = section.and_then(|p| lw::heading_scroll(&self.skin, &self.lib.view, p)).unwrap_or(0);
+    }
+
+    /// Network & Cloud. A later phase opens the hub page from here.
+    pub fn lib_open_network_hub(&mut self) {
+        self.lib_open_settings(Some("Media servers"));
+    }
+
+    /// The group's name opens its first root when it has one, and the group with it.
+    fn lib_group_click(&mut self, key: String, sid: Option<String>) {
+        if key == "network" {
+            self.lib_open_network_hub();
+            return;
+        }
+        if key.starts_with("src:") {
+            let sid = sid.unwrap_or_else(|| key.trim_start_matches("src:").to_owned());
+            if let Some(s) = self.lib.sources.iter().find(|s| s.id == sid).cloned() {
+                if let Some((node, title)) = s.roots.first().cloned() {
+                    self.lib.opened.insert(key);
+                    self.lib_open(Page::List { sid: s.id, node, title: format!("{} › {title}", s.name) }, true);
+                    return;
+                }
+            }
+        }
+        self.lib_toggle_group(&key);
+    }
+
+    fn lib_open_first_root(&mut self, sid: &str) {
+        self.lib_group_click(format!("src:{sid}"), Some(sid.to_owned()));
+    }
+
+    fn lib_refresh_source(&mut self, sid: &str) {
+        let prefix = format!("{sid}\u{1f}");
+        self.lib.cache.retain(|k, _| !k.starts_with(&prefix));
+        self.lib.failed.retain(|k, _| !k.starts_with(&prefix));
+        self.lib.inflight.retain(|k| !k.starts_with(&prefix));
+        self.lib.offline.remove(sid);
+        if self.lib_page_sid().as_deref() == Some(sid) {
+            let page = self.lib.page.clone();
+            self.lib_open(page, false);
+        } else {
+            self.lib_tree();
+        }
+    }
+
+    fn lib_hide_source(&mut self, sid: &str) {
+        let Some(b) = &self.backend else { return };
+        let mut list: Vec<String> = self.lib.config["hiddenSources"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        if !list.iter().any(|id| id == sid) {
+            list.push(sid.to_owned());
+        }
+        b.post("/api/config", json!({ "hiddenSources": list }), true);
+        b.refresh_sources();
+    }
+
+    /// What a `lib:tree:` menu id does. `Confirm` does not remove the account.
+    pub fn lib_tree_action(&mut self, id: &str, el: Option<&winit::event_loop::ActiveEventLoop>) -> Option<Vec<gamp_ui::menu::Item>> {
+        match tree_cmd(id)? {
+            TreeCmd::Open(sid) => self.lib_open_first_root(&sid),
+            TreeCmd::Refresh(sid) => self.lib_refresh_source(&sid),
+            TreeCmd::Hide(sid) => self.lib_hide_source(&sid),
+            TreeCmd::Remove(sid) => {
+                if let Some(b) = &self.backend {
+                    b.delete_account(sid);
+                }
+            }
+            TreeCmd::Manage => self.lib_open_network_hub(),
+            TreeCmd::Cancel => {}
+            TreeCmd::Confirm(sid) => {
+                let name = self.lib.sources.iter().find(|s| s.id == sid).map(|s| s.name.clone()).unwrap_or_else(|| sid.clone());
+                let items = lib_remove_confirm(&name, &sid);
+                if el.is_some() {
+                    let at = self.lib.menu_at;
+                    self.open_menu(items.clone(), at, el);
+                }
+                return Some(items);
+            }
+        }
+        None
+    }
+
+    fn lib_tree_menu(&mut self) -> Option<Vec<gamp_ui::menu::Item>> {
+        let (x, y, at) = {
+            let w = self.win(Kind::Library)?;
+            let at = w.global_cursor();
+            (w.cursor.0, w.cursor.1, (at.0 as i32, at.1 as i32))
+        };
+        let i = match self.lib_hot(x, y)? {
+            Hot::Tree(i) | Hot::TreeToggle(i) => i,
+            _ => return None,
+        };
+        self.lib.menu_at = at;
+        tree_row_menu(&self.lib.targets, &self.lib.sources, i)
+    }
+
     /// Right-click on a track: select it (unless it's in the selection)
-    /// and offer Play / Add to playlist.
+    /// and offer Play / Add to playlist. A tree row offers the source menu.
     pub fn lib_row_menu(&mut self) -> Option<Vec<gamp_ui::menu::Item>> {
         use gamp_ui::menu::Item as M;
         let (x, y) = self.win(Kind::Library)?.cursor;
-        let Some(Hot::Row(i) | Hot::Disclose(i)) = self.lib_hot(x, y) else { return None };
+        let Some(hot) = self.lib_hot(x, y) else { return None };
+        let (Hot::Row(i) | Hot::Disclose(i)) = hot else {
+            return self.lib_tree_menu();
+        };
         if !self.lib.view.table.selected.contains(&i) {
             self.lib.view.table.selected = BTreeSet::from([i]);
             self.lib.anchor = Some(i);
@@ -1583,7 +1823,7 @@ mod tests {
     #[test]
     fn recent_searches_sit_under_search_and_run_again() {
         let mut app = App::new(OutputKind::Null, None).unwrap();
-        app.lib.sources = vec![Source { id: "soundcloud".into(), name: "SoundCloud".into(), group: String::new(), roots: Vec::new(), search: true, needs_setup: false }];
+        app.lib.sources = vec![Source { id: "soundcloud".into(), name: "SoundCloud".into(), group: String::new(), roots: Vec::new(), search: true, needs_setup: false, hidden: false, removable: false }];
         app.lib_open(Page::Search { sid: "soundcloud".into(), title: "SoundCloud › Search".into() }, true);
         for q in ["deep house", "bluebird", "Deep House", "a", "b", "c", "d"] {
             app.lib.view.search.value = q.into();
@@ -1655,6 +1895,19 @@ mod tests {
 
     fn track(id: &str, title: &str) -> Item {
         Item { url: Some(format!("/m/{id}")), ..Item::track(id, title) }
+    }
+
+    fn source(id: &str, name: &str, group: &str, roots: &[(&str, &str)], removable: bool) -> Source {
+        Source {
+            id: id.into(),
+            name: name.into(),
+            group: group.into(),
+            roots: roots.iter().map(|(a, b)| ((*a).into(), (*b).into())).collect(),
+            search: false,
+            needs_setup: false,
+            hidden: false,
+            removable,
+        }
     }
 
     fn titles(app: &App) -> Vec<String> {
@@ -1858,6 +2111,200 @@ mod tests {
         let on_glyph = menu_ids(app.lib_row_menu());
         assert_eq!(on_glyph, on_row);
         assert!(on_glyph.iter().any(|id| id == "lib:open"));
+    }
+
+    #[test]
+    fn server_groups_start_closed_and_the_sets_survive_a_session() {
+        let dir = std::env::temp_dir().join(format!("gamp-lib-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.data_dir = dir.clone();
+        app.lib.sources = vec![
+            source("local", "Local Media", "local", &[("audio", "Audio")], false),
+            source("nas", "Navidrome", "network", &[("albums", "Albums")], true),
+        ];
+        app.lib_tree();
+        let labels: Vec<_> = app.lib.view.tree.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"Audio"), "a top-level group starts open");
+        assert!(!labels.contains(&"Albums"), "a server starts closed");
+        let nas = app.lib.view.tree.iter().position(|r| r.label == "Navidrome").unwrap();
+        assert!(!app.lib.view.tree[nas].open);
+        let page = app.lib.page.clone();
+        app.lib.hots = vec![(Hot::TreeToggle(nas), (0, 0, 16, 15))];
+        app.lib_press(4, 4);
+        assert!(app.lib.opened.contains("src:nas"));
+        assert!(!app.lib.collapsed.contains("src:nas"));
+        assert_eq!(app.lib.page, page, "the glyph only opens the group");
+        assert!(app.lib.view.tree.iter().any(|r| r.label == "Albums"));
+
+        let net = app.lib.view.tree.iter().position(|r| r.label == "Network & Cloud").unwrap();
+        app.lib.hots = vec![(Hot::TreeToggle(net), (0, 0, 16, 15))];
+        app.lib_press(4, 4);
+        assert!(app.lib.collapsed.contains("network"));
+        assert!(!app.lib.opened.contains("network"));
+
+        app.save_session();
+        let mut again = App::new(OutputKind::Null, None).unwrap();
+        again.data_dir = dir.clone();
+        again.load_session().unwrap();
+        assert!(again.lib.opened.contains("src:nas"));
+        assert!(again.lib.collapsed.contains("network"));
+        let old: crate::session::Session = serde_json::from_str(r#"{"searches":{"radio":["jazz"]}}"#).unwrap();
+        assert!(old.opened.is_empty() && old.collapsed.is_empty());
+        assert_eq!(old.searches["radio"], ["jazz"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clicking_a_server_name_opens_its_first_root_and_the_group() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![
+            source("nas", "Navidrome", "network", &[("albums", "Albums"), ("artists", "Artists")], true),
+            source("blank", "Empty", "network", &[], false),
+        ];
+        app.lib_tree();
+        let nas = app.lib.view.tree.iter().position(|r| r.label == "Navidrome").unwrap();
+        app.lib.hots = vec![(Hot::Tree(nas), (0, 0, 140, 15))];
+        app.lib_press(40, 4);
+        match &app.lib.page {
+            Page::List { sid, node, title } => {
+                assert_eq!(sid, "nas");
+                assert_eq!(node, "albums");
+                assert_eq!(title, "Navidrome › Albums");
+            }
+            other => panic!("opened {other:?}"),
+        }
+        assert!(app.lib.opened.contains("src:nas"));
+        assert!(app.lib.view.tree.iter().any(|r| r.label == "Albums"));
+
+        let page = app.lib.page.clone();
+        let blank = app.lib.view.tree.iter().position(|r| r.label == "Empty").unwrap();
+        app.lib.hots = vec![(Hot::Tree(blank), (0, 0, 140, 15))];
+        app.lib_press(40, 4);
+        assert_eq!(app.lib.page, page, "a server with no roots still just toggles");
+        assert!(app.lib.opened.contains("src:blank"));
+
+        let net = app.lib.view.tree.iter().position(|r| r.label == "Network & Cloud").unwrap();
+        app.lib.hots = vec![(Hot::Tree(net), (0, 0, 140, 15))];
+        app.lib_press(40, 4);
+        assert_eq!(app.lib.page, Page::Settings);
+        assert!(!app.lib.collapsed.contains("network"));
+    }
+
+    #[test]
+    fn dlna_servers_nest_under_one_group_and_hidden_sources_stay_out() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let mut secret = source("dlna-3", "Secret", "network", &[("c:0", "Browse")], false);
+        secret.hidden = true;
+        let mut gone = source("old", "Gone", "network", &[("albums", "Albums")], true);
+        gone.hidden = true;
+        app.lib.sources = vec![
+            source("nas", "Navidrome", "network", &[("albums", "Albums")], true),
+            source("dlna-1", "Living Room", "network", &[("c:0", "Browse")], false),
+            source("dlna-2", "Office", "network", &[("c:0", "Browse")], false),
+            secret,
+            gone,
+        ];
+        app.lib_tree();
+        let labels: Vec<_> = app.lib.view.tree.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"On this network (2)"));
+        assert!(labels.contains(&"Navidrome"));
+        for absent in ["Living Room", "Office", "Secret", "Gone", "Browse", "Albums"] {
+            assert!(!labels.contains(&absent), "{absent} is showing");
+        }
+        let dlna = app.lib.view.tree.iter().position(|r| r.label == "On this network (2)").unwrap();
+        assert!(!app.lib.view.tree[dlna].open);
+        assert_eq!(app.lib.view.tree[dlna].depth, 1);
+        assert_eq!(app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap().depth, 1);
+
+        app.lib.opened.insert("dlna".into());
+        app.lib_tree();
+        let labels: Vec<_> = app.lib.view.tree.iter().map(|r| r.label.as_str()).collect();
+        let at = labels.iter().position(|l| *l == "On this network (2)").unwrap();
+        assert_eq!(&labels[at + 1..at + 3], &["Living Room", "Office"]);
+        assert_eq!(app.lib.view.tree[at + 1].depth, 2);
+        assert!(!app.lib.view.tree[at + 1].open);
+        assert!(!labels.contains(&"Browse"));
+    }
+
+    #[test]
+    fn a_failed_network_listing_marks_the_server_offline_until_it_answers() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![
+            source("nas", "Navidrome", "network", &[("albums", "Albums")], true),
+            source("radio", "Internet Radio", "internet", &[("top", "Top Stations")], false),
+        ];
+        app.lib_tree();
+        app.lib_listing(list_key("nas", "albums"), Err("no route".into()));
+        let row = app.lib.view.tree.iter().find(|r| r.label.starts_with("Navidrome")).unwrap();
+        assert!(row.dim);
+        assert!(row.label.ends_with(" · offline"));
+        assert_eq!(app.lib.offline.get("nas").map(String::as_str), Some("no route"));
+
+        app.lib_listing(list_key("radio", "top"), Err("nope".into()));
+        assert!(!app.lib.offline.contains_key("radio"));
+        assert!(!app.lib.view.tree.iter().find(|r| r.label == "Internet Radio").unwrap().dim);
+
+        app.lib_listing(list_key("nas", "albums"), Ok(Listing::of(vec![])));
+        let row = app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap();
+        assert!(!row.dim);
+        assert!(app.lib.offline.is_empty());
+    }
+
+    #[test]
+    fn the_tree_menu_removes_only_accounts_and_hides_only_dlna() {
+        use crate::app::Kind;
+        use gamp_ui::library_window::Hot;
+        let account = source("plex-1", "Plex", "network", &[("albums", "Albums")], true);
+        let dlna = source("dlna-tv", "TV", "network", &[("c:0", "Browse")], false);
+        let cloud = source("cloud-dropbox", "Dropbox", "network", &[("files", "Files")], true);
+        let radio = source("radio", "Internet Radio", "internet", &[("top", "Top")], false);
+        let ids = |s: &Source| menu_ids(Some(source_menu(s)));
+        assert!(ids(&account).iter().any(|id| id == "lib:tree:remove:plex-1"));
+        assert!(!ids(&account).iter().any(|id| id.starts_with("lib:tree:hide:")));
+        assert!(ids(&dlna).iter().any(|id| id == "lib:tree:hide:dlna-tv"));
+        assert!(!ids(&dlna).iter().any(|id| id.starts_with("lib:tree:remove")));
+        assert!(!ids(&cloud).iter().any(|id| id.starts_with("lib:tree:remove")));
+        assert!(!ids(&radio).iter().any(|id| id.starts_with("lib:tree:hide:") || id.starts_with("lib:tree:remove")));
+        assert!(ids(&radio).iter().any(|id| id == "lib:tree:open:radio"));
+
+        assert!(matches!(tree_cmd("lib:tree:remove:plex-1"), Some(TreeCmd::Confirm(sid)) if sid == "plex-1"));
+        assert!(matches!(tree_cmd("lib:tree:remove!:plex-1"), Some(TreeCmd::Remove(_))));
+        let confirm = menu_ids(Some(lib_remove_confirm("Plex", "plex-1")));
+        assert_eq!(confirm, ["lib:tree:remove!:plex-1", "lib:tree:cancel"]);
+
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![account, dlna];
+        app.lib_tree();
+        let yielded = app.lib_tree_action("lib:tree:remove:plex-1", None).expect("asks before removing");
+        assert_eq!(menu_ids(Some(yielded)), ["lib:tree:remove!:plex-1", "lib:tree:cancel"]);
+        app.menu_action("lib:tree:remove:plex-1", None);
+        assert_eq!(app.lib.sources.len(), 2, "asking does not delete");
+        assert!(app.backend.is_none());
+
+        // The server starts closed, so open it to reach the leaf.
+        app.lib.opened.insert("src:plex-1".into());
+        app.lib_tree();
+        let net = app.lib.targets.iter().position(|t| matches!(t, Target::Group { key, .. } if key == "network")).unwrap();
+        let plex = app.lib.targets.iter().position(|t| matches!(t, Target::Group { key, .. } if key == "src:plex-1")).unwrap();
+        let leaf = app.lib.targets.iter().position(|t| matches!(t, Target::Open { sid, node, .. } if sid == "plex-1" && node == "albums")).unwrap();
+        let fav = app.lib.targets.iter().position(|t| matches!(t, Target::Open { sid, .. } if sid == "favorites")).unwrap();
+        app.lib.hots = vec![
+            (Hot::Tree(net), (0, 0, 100, 15)),
+            (Hot::TreeToggle(net), (0, 0, 12, 15)),
+            (Hot::Tree(plex), (0, 20, 100, 15)),
+            (Hot::Tree(leaf), (0, 40, 100, 15)),
+            (Hot::Tree(fav), (0, 60, 100, 15)),
+        ];
+        app.wins.get_mut(&Kind::Library).unwrap().cursor = (6, 4);
+        assert_eq!(menu_ids(app.lib_row_menu()), ["lib:tree:manage"]);
+        app.wins.get_mut(&Kind::Library).unwrap().cursor = (40, 24);
+        assert!(menu_ids(app.lib_row_menu()).iter().any(|id| id == "lib:tree:remove:plex-1"));
+        app.wins.get_mut(&Kind::Library).unwrap().cursor = (40, 44);
+        assert!(menu_ids(app.lib_row_menu()).iter().any(|id| id == "lib:tree:open:plex-1"));
+        app.wins.get_mut(&Kind::Library).unwrap().cursor = (40, 64);
+        assert!(app.lib_row_menu().is_none());
     }
 
     #[test]

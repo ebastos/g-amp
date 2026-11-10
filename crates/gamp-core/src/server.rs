@@ -64,6 +64,8 @@ pub fn router(port: u16, page: Router) -> Router {
         .route("/api/accounts", post(|Json(new): Json<NewAccount>| async move { sources::add(new).await.map(Json) }))
         .route("/api/accounts/{id}", delete(|UrlPath(id): UrlPath<String>| async move {
             sources::remove_account(&id).await.map(|_| StatusCode::NO_CONTENT)
+        }).post(|UrlPath(id): UrlPath<String>, Json(body): Json<AccountName>| async move {
+            sources::rename(&id, &body.name).await.map(Json)
         }))
         .route("/media/remote/{sid}/{id}", get(|UrlPath((sid, id)): UrlPath<(String, String)>, Query(q): Query<HashMap<String, String>>, headers: HeaderMap| async move {
             sources::media(&sid, &id, q.get("s").map(String::as_str).unwrap_or_default(), &headers).await
@@ -164,6 +166,7 @@ async fn public_config(dropbox_redirect: String) -> Value {
         "cloud": crate::cloud::folders().iter().map(|f| json!({ "name": f.name, "path": f.path })).collect::<Vec<_>>(),
         "dropbox": { "key": c.dropbox_key, "builtIn": !sources::dropbox::APP_KEY.is_empty(), "redirectUri": dropbox_redirect },
         "dlnaSearching": sources::dlna::searching(),
+        "hiddenSources": c.hidden_sources,
     })
 }
 
@@ -172,11 +175,18 @@ async fn get_config(dropbox_redirect: String) -> Json<Value> {
 }
 
 #[derive(Deserialize)]
+struct AccountName {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigPatch {
     folders: Option<Vec<String>>,
     soundcloud_profile: Option<String>,
     dropbox_key: Option<String>,
+    hidden_sources: Option<Vec<String>>,
 }
 
 async fn post_config(Json(patch): Json<ConfigPatch>, dropbox_redirect: String) -> Result<Json<Value>, ApiError> {
@@ -198,6 +208,9 @@ async fn post_config(Json(patch): Json<ConfigPatch>, dropbox_redirect: String) -
     }
     if let Some(k) = patch.dropbox_key {
         c.dropbox_key = k.trim().to_owned();
+    }
+    if let Some(hidden) = patch.hidden_sources {
+        c.hidden_sources = hidden;
     }
     store::save_config(c).await?;
     Ok(Json(public_config(dropbox_redirect).await))
