@@ -3,6 +3,7 @@
 //! Settings forms (folders, media servers, Dropbox, Spotify, SoundCloud).
 
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use gamp_core::catalog::Source;
 use gamp_core::skin_museum as museum;
@@ -33,6 +34,8 @@ pub enum Target {
     Recent { sid: String, title: String, query: String },
     /// Settings, scrolled to the section whose heading starts so.
     Settings(Option<&'static str>),
+    /// The add-a-server flow (the empty Network & Cloud group).
+    Add,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +43,10 @@ pub enum Page {
     List { sid: String, node: String, title: String },
     Search { sid: String, title: String },
     Settings,
+    /// Servers, cloud folders, shares and anything found on the network.
+    Network,
+    /// Step 1 picks a kind (`None`); step 2 is that kind's form.
+    Add { kind: Option<&'static str> },
 }
 
 impl Page {
@@ -48,18 +55,42 @@ impl Page {
             Page::List { sid, node, .. } => list_key(sid, node),
             Page::Search { sid, .. } => list_key(sid, "search"),
             Page::Settings => "settings".into(),
+            Page::Network => "network".into(),
+            Page::Add { kind: None } => "add".into(),
+            Page::Add { kind: Some(k) } => format!("add:{k}"),
         }
     }
 }
 
-/// Media server kinds for the "Add server" form.
-const KINDS: &[(&str, &str, &str)] = &[
-    ("jellyfin", "Jellyfin or Emby", "http://nas:8096"),
-    ("subsonic", "Navidrome / Subsonic", "http://nas:4533"),
-    ("synology", "Synology Audio Station", "QuickConnect ID, or http://diskstation:5000"),
-    ("webdav", "WebDAV / Nextcloud", "https://nas:5006/music"),
-    ("plex", "Plex (address and token)", "http://nas:32400"),
+/// One kind of server the Add flow can connect. Address placeholder, the
+/// heading, and the help line under it.
+struct KindForm {
+    id: &'static str,
+    label: &'static str,
+    url_ph: &'static str,
+    help: &'static str,
+}
+
+const KINDS: &[KindForm] = &[
+    KindForm { id: "jellyfin", label: "Jellyfin or Emby", url_ph: "http://nas:8096", help: "The address you open Jellyfin or Emby at, like http://nas:8096." },
+    KindForm { id: "subsonic", label: "Navidrome or Subsonic", url_ph: "http://nas:4533", help: "The address you open Navidrome at, like http://nas:4533." },
+    KindForm { id: "synology", label: "Synology Audio Station", url_ph: "QuickConnect ID, or http://diskstation:5000", help: "Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one." },
+    KindForm { id: "webdav", label: "WebDAV or Nextcloud", url_ph: "https://nas:5006/music", help: "The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you." },
+    KindForm { id: "plex", label: "Plex", url_ph: "http://nas:32400", help: "The server's address, like http://nas:32400, and an X-Plex-Token." },
 ];
+
+fn kind_form(id: &str) -> Option<&'static KindForm> {
+    KINDS.iter().find(|k| k.id == id)
+}
+
+/// Fields Tab walks on the Add form for this kind, in order.
+fn kind_fields(id: &str) -> &'static [&'static str] {
+    match id {
+        "plex" => &["srv_name", "srv_url", "srv_pass"],
+        "synology" => &["srv_name", "srv_url", "srv_user", "srv_pass", "srv_otp"],
+        _ => &["srv_name", "srv_url", "srv_user", "srv_pass"],
+    }
+}
 
 pub struct LibState {
     pub view: lw::View,
@@ -90,8 +121,21 @@ pub struct LibState {
     pub fields: HashMap<String, Field>,
     pub focus: Option<String>,
     pub config: Value,
-    pub kind: usize,
     pub insecure: bool,
+    /// A Remove or Disconnect button waiting for a second click, and when it was armed.
+    pub armed: Option<(String, Instant)>,
+    /// The server whose name is being edited (`fields["rename"]`).
+    pub renaming: Option<String>,
+    /// Last health check for a server or cloud folder.
+    pub health: HashMap<String, (Instant, Result<(), String>)>,
+    /// Checks asked for and not answered yet.
+    pub checking: BTreeSet<String>,
+    /// The last add failed because the certificate is not trusted.
+    pub cert_error: bool,
+    /// Inline result under the Add form's Connect button: text, and whether it is an error.
+    pub add_note: Option<(String, bool)>,
+    /// An add is in flight. Connect is ignored until `Reply::Added` arrives.
+    pub adding: bool,
     pub scan: Option<gamp_core::library::Status>,
     pub anchor: Option<usize>,
     /// Each source's recent searches, newest first (kept in the session).
@@ -110,6 +154,7 @@ impl Default for LibState {
             ("folder_path", "Or type a path", false),
             ("share", "smb://diskstation/music", false),
             ("sc_profile", "Your profile: soundcloud.com/you", false),
+            ("rename", "Name", false),
         ] {
             fields.insert(id.to_owned(), Field { placeholder: ph.into(), password: pw, ..Default::default() });
         }
@@ -137,8 +182,14 @@ impl Default for LibState {
             fields,
             focus: None,
             config: Value::Null,
-            kind: 0,
             insecure: false,
+            armed: None,
+            renaming: None,
+            health: HashMap::new(),
+            checking: BTreeSet::new(),
+            cert_error: false,
+            add_note: None,
+            adding: false,
             scan: None,
             anchor: None,
             recent: HashMap::new(),
@@ -224,6 +275,9 @@ impl App {
                 Reply::Sources(s) => {
                     self.lib.sources = s;
                     self.lib_tree();
+                    if self.lib_is_form() {
+                        self.lib_rebuild_form();
+                    }
                 }
                 Reply::Listing { key, result } => self.lib_listing(key, result),
                 Reply::Config(c) => {
@@ -234,19 +288,30 @@ impl App {
                     if c["dlnaSearching"] == true && self.pending_refresh.is_none() {
                         self.pending_refresh = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                     }
+                    // hiddenSources and found are posted ahead of the server knowing
+                    // them. A config reply that omits the key must not wipe the list.
+                    let mut c = c;
+                    for key in ["hiddenSources", "found"] {
+                        if c.get(key).is_none()
+                            && let Some(v) = self.lib.config.get(key).cloned()
+                            && let Some(obj) = c.as_object_mut()
+                        {
+                            obj.insert(key.to_owned(), v);
+                        }
+                    }
                     self.lib.config = c;
-                    if self.lib.page == Page::Settings {
-                        self.lib_form();
+                    if self.lib_is_form() {
+                        self.lib_rebuild_form();
                     }
                     self.lib_tree();
                 }
                 Reply::Message(m) => {
                     self.lib.view.status = m.clone();
                     self.main.message = None;
-                    // The settings form covers the status line, or the library is
+                    // A form covers the status line, or the library is
                     // closed (Add to Favorites from the playlist): say it in the display.
                     let lib_hidden = !self.wins.get(&Kind::Library).is_some_and(|w| w.visible);
-                    if (self.lib.page == Page::Settings || lib_hidden) && !m.is_empty() {
+                    if (self.lib_is_form() || lib_hidden) && !m.is_empty() {
                         self.say(&m);
                     }
                     // Favourites and subscriptions changed: reload them.
@@ -276,10 +341,18 @@ impl App {
                             self.lib_open(p, false);
                         }
                     }
-                    if self.lib.page == Page::Settings {
-                        self.lib_form();
+                    if self.lib_is_form() {
+                        self.lib_rebuild_form();
                     }
                 }
+                Reply::Health { sid, result } => {
+                    self.lib.checking.remove(&sid);
+                    self.lib.health.insert(sid, (Instant::now(), result));
+                    if matches!(&self.lib.page, Page::Network) {
+                        self.lib_network_form();
+                    }
+                }
+                Reply::Added(r) => self.lib_added(r),
             }
         }
         self.mark(Kind::Library);
@@ -348,7 +421,7 @@ impl App {
         if group(&mut rows, &mut targets, "network", "Network & Cloud", 0) {
             let network: Vec<&Source> = src.iter().filter(|s| s.group == "network").collect();
             if network.is_empty() {
-                leaf(&mut rows, &mut targets, Target::Settings(Some("Media servers")), "Add a server…", 1);
+                leaf(&mut rows, &mut targets, Target::Add, "Add a server…", 1);
             }
             for s in network {
                 if group(&mut rows, &mut targets, &format!("src:{}", s.id), &s.name, 1) {
@@ -411,6 +484,17 @@ impl App {
                 }
                 self.lib_form();
             }
+            Page::Network => {
+                self.lib.view.search_shown = false;
+                self.lib.view.form_scroll = 0;
+                self.lib_request_checks();
+                self.lib_network_form();
+            }
+            Page::Add { .. } => {
+                self.lib.view.search_shown = false;
+                self.lib.view.form_scroll = 0;
+                self.lib_add_form();
+            }
             Page::Search { sid, .. } => {
                 self.lib.view.search_shown = true;
                 self.lib.view.search.placeholder = match sid.as_str() {
@@ -465,7 +549,7 @@ impl App {
     fn lib_page_sid(&self) -> Option<String> {
         match &self.lib.page {
             Page::List { sid, .. } | Page::Search { sid, .. } => Some(sid.clone()),
-            Page::Settings => None,
+            Page::Settings | Page::Network | Page::Add { .. } => None,
         }
     }
 
@@ -806,6 +890,7 @@ impl App {
                         self.lib_open(Page::Settings, true);
                         self.lib.view.form_scroll = section.and_then(|p| lw::heading_scroll(&self.skin, &self.lib.view, p)).unwrap_or(0);
                     }
+                    Some(Target::Add) => self.lib_open(Page::Add { kind: None }, true),
                     None => {}
                 }
                 return;
@@ -847,6 +932,8 @@ impl App {
             }
             Hot::Form(id) => {
                 if self.lib.fields.contains_key(id) {
+                    // A click anywhere but the armed button disarms it.
+                    self.lib.armed = None;
                     self.lib_focus(Some(id.clone()));
                     return;
                 }
@@ -1018,7 +1105,7 @@ impl App {
         if !is_playable(&item) {
             let sid = match &self.lib.page {
                 Page::List { sid, .. } | Page::Search { sid, .. } => sid.clone(),
-                Page::Settings => return,
+                Page::Settings | Page::Network | Page::Add { .. } => return,
             };
             self.lib.trail.push(self.lib.page.clone());
             self.lib_open(Page::List { sid, node: item.id.clone(), title: item.title.clone() }, false);
@@ -1171,7 +1258,7 @@ impl App {
                     let sel = self.lib_selected();
                     let sid = match &self.lib.page {
                         Page::List { sid, .. } | Page::Search { sid, .. } => sid.clone(),
-                        Page::Settings => return,
+                        Page::Settings | Page::Network | Page::Add { .. } => return,
                     };
                     if sel.is_empty() {
                         self.lib.view.status = "Select something first.".into();
@@ -1192,8 +1279,8 @@ impl App {
         for (k, f) in self.lib.fields.iter_mut() {
             f.focused = id.as_deref() == Some(k.as_str());
         }
-        if self.lib.page == Page::Settings {
-            self.lib_form();
+        if self.lib_is_form() {
+            self.lib_rebuild_form();
         }
         self.mark(Kind::Library);
     }
@@ -1269,12 +1356,15 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 self.lib_submit(&focus);
             }
-            Key::Named(NamedKey::Escape) => self.lib_focus(None),
+            Key::Named(NamedKey::Escape) => {
+                self.lib.renaming = None;
+                self.lib_focus(None);
+            }
             Key::Named(NamedKey::Tab) => {
-                // Next field in the form.
-                let order = ["srv_name", "srv_url", "srv_user", "srv_pass", "srv_otp"];
+                let order = self.lib_tab_order();
                 if let Some(i) = order.iter().position(|o| *o == focus) {
-                    self.lib_focus(Some(order[(i + 1) % order.len()].into()));
+                    let next = order[(i + 1) % order.len()].clone();
+                    self.lib_focus(Some(next));
                 }
             }
             Key::Named(NamedKey::Backspace) => {
@@ -1332,8 +1422,8 @@ impl App {
             self.lib.filter = self.lib.view.search.value.clone();
             self.lib_show();
         }
-        if self.lib.page == Page::Settings {
-            self.lib_form();
+        if self.lib_is_form() {
+            self.lib_rebuild_form();
         }
         self.mark(Kind::Library);
         true
@@ -1394,6 +1484,7 @@ impl App {
                     self.lib_tree();
                 }
             }
+            "rename" => self.lib_form_action("rename:save"),
             id if id.starts_with("srv_") => self.lib_form_action("srv:add"),
             "folder_path" => self.lib_form_action("folder:path"),
             "share" => self.lib_form_action("share:connect"),
@@ -1421,12 +1512,213 @@ impl App {
         }
     }
 
+    fn set_value(&mut self, id: &str, value: &str) {
+        if let Some(f) = self.lib.fields.get_mut(id) {
+            f.value = value.to_owned();
+            f.end();
+        }
+    }
+
+    fn lib_is_form(&self) -> bool {
+        matches!(&self.lib.page, Page::Settings | Page::Network | Page::Add { .. })
+    }
+
+    fn lib_rebuild_form(&mut self) {
+        match self.lib.page.clone() {
+            Page::Settings => self.lib_form(),
+            Page::Network => self.lib_network_form(),
+            Page::Add { .. } => self.lib_add_form(),
+            _ => {}
+        }
+    }
+
+    fn lib_tab_order(&self) -> Vec<String> {
+        match &self.lib.page {
+            Page::Add { kind: Some(k) } => kind_fields(k).iter().map(|s| (*s).to_owned()).collect(),
+            Page::Network if self.lib.renaming.is_some() => vec!["rename".into(), "share".into()],
+            Page::Network => vec!["share".into()],
+            Page::Settings => vec!["folder_path".into(), "sc_profile".into()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn lib_expire_arm(&mut self) {
+        if self.lib.armed.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(4)) {
+            self.lib.armed = None;
+        }
+    }
+
+    /// First click arms `id`. A second click within 4 seconds returns true.
+    fn lib_take_arm(&mut self, id: &str) -> bool {
+        let fresh = self.lib.armed.as_ref().is_some_and(|(i, at)| i == id && at.elapsed() < Duration::from_secs(4));
+        if fresh {
+            self.lib.armed = None;
+            true
+        } else {
+            self.lib.armed = Some((id.to_owned(), Instant::now()));
+            false
+        }
+    }
+
+    fn button_label(&self, id: &str, normal: &str) -> String {
+        if self.lib.armed.as_ref().is_some_and(|(i, at)| i == id && at.elapsed() < Duration::from_secs(4)) { "Really remove?".into() } else { normal.into() }
+    }
+
+    fn lib_item(&self, id: &str, label: String, detail: String, buttons: Vec<(String, &str)>) -> W {
+        let buttons = buttons
+            .into_iter()
+            .map(|(bid, blabel)| {
+                let shown = if bid.starts_with("folder:rm:") || bid.starts_with("srv:rm:") { self.button_label(&bid, blabel) } else { blabel.to_owned() };
+                (bid, shown)
+            })
+            .collect();
+        W::Item { id: id.into(), label, detail, buttons }
+    }
+
+    fn folder_list(&self) -> Vec<String> {
+        self.lib.config["folders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+    }
+
+    fn hidden_ids(&self) -> Vec<String> {
+        self.lib.config["hiddenSources"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+    }
+
+    fn lib_config_put(&mut self, key: &str, value: Value) {
+        if !self.lib.config.is_object() {
+            self.lib.config = json!({});
+        }
+        if let Some(obj) = self.lib.config.as_object_mut() {
+            obj.insert(key.to_owned(), value);
+        }
+    }
+
+    fn lib_set_hidden(&mut self, ids: Vec<String>) {
+        self.lib_config_put("hiddenSources", json!(ids.clone()));
+        if let Some(b) = &self.backend {
+            b.post("/api/config", json!({ "hiddenSources": ids }), true);
+        }
+    }
+
+    fn health_text(&self, sid: &str) -> String {
+        match self.lib.health.get(sid) {
+            Some((_, Ok(()))) => t("OK").into(),
+            Some((_, Err(e))) => t(e).into(),
+            None => t("Checking…").into(),
+        }
+    }
+
+    fn lib_request_checks(&mut self) {
+        if self.backend.is_none() {
+            return;
+        }
+        let hidden = self.hidden_ids();
+        let ids: Vec<String> = self
+            .lib
+            .sources
+            .iter()
+            .filter(|s| (is_your_server(s) && !hidden.iter().any(|h| h == &s.id)) || s.id.starts_with("cloud-"))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in ids {
+            let fresh = self.lib.health.get(&id).is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(60));
+            if fresh || !self.lib.checking.insert(id.clone()) {
+                continue;
+            }
+            if let Some(b) = &self.backend {
+                b.check(id);
+            }
+        }
+    }
+
+    /// Opens the Network & Cloud hub. The tree label calls this.
+    pub fn lib_open_network(&mut self) {
+        self.lib_open(Page::Network, true);
+    }
+
+    fn lib_open_root(&mut self, s: &Source) {
+        let Some((node, title)) = s.roots.first() else { return };
+        self.lib_open(Page::List { sid: s.id.clone(), node: node.clone(), title: format!("{} › {title}", s.name) }, true);
+    }
+
+    fn lib_scroll_heading(&mut self, prefix: &str) {
+        self.lib.view.form_scroll = lw::heading_scroll(&self.skin, &self.lib.view, prefix).unwrap_or(0);
+    }
+
+    /// Saves a source's new name. Wired to Backend::rename after Phase 2 merges.
+    fn lib_rename_source(&mut self, sid: String, name: String) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(s) = self.lib.sources.iter_mut().find(|s| s.id == sid) {
+            s.name = name;
+        }
+        self.lib.view.status = t("Saved").into();
+    }
+
+    /// What `Reply::Added` does. On the Add page, an error stays on the form and
+    /// success opens the new server. Anywhere else, the page stays put.
+    fn lib_added(&mut self, r: Result<Value, String>) {
+        self.lib.adding = false;
+        let on_add = matches!(&self.lib.page, Page::Add { .. });
+        match r {
+            Err(e) => {
+                self.lib.cert_error = e == gamp_core::sources::CERT_UNTRUSTED || gamp_core::sources::is_cert_error(&e);
+                if !on_add {
+                    self.lib.view.status = e.clone();
+                }
+                self.lib.add_note = Some((e, true));
+                if self.lib_is_form() {
+                    self.lib_rebuild_form();
+                }
+            }
+            Ok(info) => {
+                self.clear(&["srv_pass", "srv_otp", "srv_name", "srv_url", "srv_user"]);
+                self.lib.add_note = None;
+                self.lib.cert_error = false;
+                let sid = info["id"].as_str().unwrap_or("").to_owned();
+                let name = info["name"].as_str().unwrap_or("").to_owned();
+                let node = info["roots"][0]["id"].as_str().unwrap_or("").to_owned();
+                let root_title = info["roots"][0]["title"].as_str().unwrap_or("").to_owned();
+                self.lib.collapsed.remove(&format!("src:{sid}"));
+                if on_add {
+                    self.lib_open(Page::List { sid, node, title: format!("{name} › {root_title}") }, true);
+                } else {
+                    self.lib.view.status = tf("Added {}", &[&name]);
+                }
+            }
+        }
+    }
+
+    fn lib_add_found(&mut self, i: usize) {
+        let Some(v) = self.lib.config["found"].get(i).cloned() else { return };
+        let kind = v["kind"].as_str().unwrap_or("");
+        let name = v["name"].as_str().unwrap_or("").to_owned();
+        let url = v["url"].as_str().unwrap_or("").to_owned();
+        match kind {
+            "plex" => {
+                if let Some(b) = &self.backend {
+                    open_in_browser(&b.url("/auth/plex/login"));
+                }
+            }
+            "jellyfin" | "emby" => {
+                self.set_value("srv_url", &url);
+                self.set_value("srv_name", &name);
+                self.lib.cert_error = false;
+                self.lib.add_note = None;
+                self.lib_open(Page::Add { kind: Some("jellyfin") }, true);
+                self.lib_focus(Some("srv_user".into()));
+            }
+            _ => {}
+        }
+    }
+
     pub fn lib_form(&mut self) {
         let c = self.lib.config.clone();
         let platform = c["platform"].as_str().unwrap_or(std::env::consts::OS).to_owned();
         let mut f = vec![W::Heading("Music folders and network drives".into())];
         f.push(W::Text(match platform.as_str() {
-            "macos" => "Add any folder. Network drives work once mounted in Finder (Go › Connect to Server, or use Connect below); they appear under /Volumes.",
+            "macos" => "Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.",
             "windows" => "Add any folder, a mapped drive, or a \\\\server\\share path.",
             _ => "Add any folder, including network shares mounted under /mnt or /media.",
         }
@@ -1436,7 +1728,8 @@ impl App {
             f.push(W::Text("No folders yet.".into()));
         }
         for (i, p) in folders.iter().enumerate() {
-            f.push(W::Item { id: format!("folder:rm:{i}"), label: p.clone(), button: "Remove".into() });
+            let rm = format!("folder:rm:{i}");
+            f.push(self.lib_item(&rm, p.clone(), String::new(), vec![(rm.clone(), "Remove")]));
         }
         let scan = match &self.lib.scan {
             Some(s) if s.scanning => tf("Scanning… {} files, {} tracks", &[&s.scanned, &s.found]),
@@ -1445,47 +1738,10 @@ impl App {
         };
         f.push(W::Row(vec![W::button("folder:add", "Add folder…"), W::button("folder:rescan", "Rescan"), W::Text(scan)]));
         f.push(W::Row(vec![self.field("folder_path"), W::button("folder:path", "Add path")]));
-        if matches!(platform.as_str(), "macos" | "windows" | "linux") {
-            f.push(W::Row(vec![self.field("share"), W::button("share:connect", "Connect to share")]));
-        }
 
-        f.push(W::Heading("Media servers (at home or over the internet)".into()));
-        f.push(W::Text("Plex, Jellyfin, Navidrome and other Subsonic servers, Synology Audio Station, WebDAV and Nextcloud. DLNA servers on your network appear by themselves.".into()));
-        for s in self.lib.sources.iter().filter(|s| s.group == "network" && !s.id.starts_with("dlna-") && !s.id.starts_with("dropbox-") && !s.id.starts_with("cloud-")) {
-            f.push(W::Item { id: format!("srv:rm:{}", s.id), label: s.name.clone(), button: "Remove".into() });
-        }
-        f.push(W::Row(vec![W::button("plex:signin", "Sign in with Plex"), W::Text("Adds every Plex server on your account.".into())]));
-        let (kid, klabel, kph) = KINDS[self.lib.kind % KINDS.len()];
-        if let Some(fl) = self.lib.fields.get_mut("srv_url") {
-            fl.placeholder = kph.into();
-        }
-        if let Some(fl) = self.lib.fields.get_mut("srv_pass") {
-            fl.placeholder = if kid == "plex" { "X-Plex-Token".into() } else { "Password".into() };
-        }
-        f.push(W::Row(vec![W::button("srv:kind", &tf("Type: {} ›", &[&t(klabel)])), self.field("srv_name")]));
-        f.push(W::Row(vec![self.field("srv_url")]));
-        if kid == "synology" {
-            f.push(W::Row(vec![self.field("srv_user"), self.field("srv_pass"), self.field("srv_otp")]));
-        } else if kid == "plex" {
-            f.push(W::Row(vec![self.field("srv_pass")]));
-        } else {
-            f.push(W::Row(vec![self.field("srv_user"), self.field("srv_pass")]));
-        }
-        f.push(W::Row(vec![W::Check { id: "srv:insecure".into(), label: "Accept a self-signed certificate".into(), checked: self.lib.insecure }, W::button("srv:add", "Add server")]));
-        f.push(W::Row(vec![W::button("dlna:search", "Search the network again")]));
-
-        f.push(W::Heading("Dropbox, Google Drive and OneDrive".into()));
-        // Accounts signed in through Dropbox's web API (older versions).
-        for s in self.lib.sources.iter().filter(|s| s.id.starts_with("dropbox-")) {
-            f.push(W::Item { id: format!("srv:rm:{}", s.id), label: s.name.clone(), button: "Disconnect".into() });
-        }
-        let cloud: Vec<String> = c["cloud"].as_array().map(|a| a.iter().filter_map(|v| v["name"].as_str().map(str::to_owned)).collect()).unwrap_or_default();
-        f.push(W::Text("Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up under Network & Cloud by itself. Songs download as you play them.".into()));
-        f.push(W::Row(vec![
-            W::button("cloud:get", "Get Dropbox"),
-            W::button("cloud:look", "Look again"),
-            W::Text(if cloud.is_empty() { "None on this computer yet".into() } else { tf("Found: {}", &[&cloud.join(", ")]) }),
-        ]));
+        f.push(W::Heading("Network & Cloud".into()));
+        f.push(W::Text("Media servers, NAS boxes, cloud drives and network shares.".into()));
+        f.push(W::Row(vec![W::button("net:open", "Manage Network & Cloud…")]));
 
         f.push(W::Heading("Spotify (Premium)".into()));
         f.push(W::Text("Sign in once in your web browser. Your Liked Songs, playlists and search then show here, and songs play through Gamp's equalizer and visualizers.".into()));
@@ -1507,36 +1763,232 @@ impl App {
         self.mark(Kind::Library);
     }
 
+    fn lib_network_form(&mut self) {
+        self.lib_expire_arm();
+        let hidden = self.hidden_ids();
+        let sources = self.lib.sources.clone();
+        let folders = self.folder_list();
+        let mut f = vec![
+            W::Heading("Network & Cloud".into()),
+            W::Text("Servers, cloud folders and network shares.".into()),
+            W::Row(vec![W::button("add:open", "Add a server or cloud…"), W::button("dlna:search", "Search the network again")]),
+            W::Heading("Your servers".into()),
+        ];
+        let servers: Vec<&Source> = sources.iter().filter(|s| is_your_server(s) && !hidden.iter().any(|h| h == &s.id)).collect();
+        if servers.is_empty() {
+            f.push(W::Text("No servers yet.".into()));
+        }
+        for s in servers {
+            if self.lib.renaming.as_deref() == Some(s.id.as_str()) {
+                f.push(W::Row(vec![self.field("rename"), W::button("rename:save", "Save"), W::button("rename:cancel", "Cancel")]));
+            } else {
+                let detail = format!("{} · {} · {}", t(&s.kind), s.address, self.health_text(&s.id));
+                let open = format!("srv:open:{}", s.id);
+                let rename = format!("srv:rename:{}", s.id);
+                let rm = format!("srv:rm:{}", s.id);
+                f.push(self.lib_item(&s.id, s.name.clone(), detail, vec![(open, "Open"), (rename, "Rename"), (rm, "Remove")]));
+            }
+        }
+
+        f.push(W::Heading("Cloud folders".into()));
+        for s in sources.iter().filter(|s| s.id.starts_with("cloud-")) {
+            let open = format!("srv:open:{}", s.id);
+            f.push(self.lib_item(&s.id, s.name.clone(), String::new(), vec![(open, "Open")]));
+        }
+        for s in sources.iter().filter(|s| s.id.starts_with("dropbox-")) {
+            let open = format!("srv:open:{}", s.id);
+            let rm = format!("srv:rm:{}", s.id);
+            f.push(self.lib_item(&s.id, s.name.clone(), String::new(), vec![(open, "Open"), (rm, "Disconnect")]));
+        }
+        let cloud: Vec<String> = self.lib.config["cloud"].as_array().map(|a| a.iter().filter_map(|v| v["name"].as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        f.push(W::Row(vec![
+            W::button("cloud:get", "Get Dropbox"),
+            W::button("cloud:look", "Look again"),
+            W::Text(if cloud.is_empty() { "None on this computer yet".into() } else { tf("Found: {}", &[&cloud.join(", ")]) }),
+        ]));
+        f.push(W::Text("Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.".into()));
+
+        f.push(W::Heading("Network shares".into()));
+        for (i, p) in folders.iter().enumerate() {
+            if !is_network_path(p) {
+                continue;
+            }
+            let rm = format!("folder:rm:{i}");
+            f.push(self.lib_item(&rm, p.clone(), "Scanned into Local Media".into(), vec![("folder:rescan".into(), "Rescan"), (rm.clone(), "Remove")]));
+        }
+        f.push(W::Row(vec![self.field("share"), W::button("share:connect", "Connect to share")]));
+
+        f.push(W::Heading("Found on your network".into()));
+        let mut any = false;
+        for s in sources.iter().filter(|s| s.id.starts_with("dlna-") && !hidden.iter().any(|h| h == &s.id)) {
+            any = true;
+            let open = format!("srv:open:{}", s.id);
+            let hide = format!("srv:hide:{}", s.id);
+            f.push(self.lib_item(&s.id, s.name.clone(), "DLNA".into(), vec![(open, "Open"), (hide, "Hide")]));
+        }
+        let found = self.lib.config["found"].as_array().cloned().unwrap_or_default();
+        for (i, v) in found.iter().enumerate() {
+            any = true;
+            let kind = v["kind"].as_str().unwrap_or("");
+            let kind_label = match kind {
+                "plex" => "Plex",
+                "jellyfin" => "Jellyfin",
+                "emby" => "Emby",
+                other => other,
+            };
+            let name = v["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(kind_label).to_owned();
+            let url = v["url"].as_str().unwrap_or("");
+            let detail = format!("{} · {url}", t(kind_label));
+            let add = format!("found:{i}");
+            f.push(self.lib_item(&add, name, detail, vec![(add.clone(), "Add")]));
+        }
+        if !any {
+            f.push(W::Text("Nothing found yet. DLNA servers on your network appear by themselves.".into()));
+        }
+
+        if !hidden.is_empty() {
+            f.push(W::Heading(tf("Hidden ({})", &[&hidden.len()])));
+            for id in &hidden {
+                let label = sources.iter().find(|s| &s.id == id).map(|s| s.name.clone()).unwrap_or_else(|| id.clone());
+                let show = format!("srv:show:{id}");
+                f.push(self.lib_item(id, label, String::new(), vec![(show, "Show")]));
+            }
+        }
+        self.lib.view.form = Some(f);
+        self.mark(Kind::Library);
+    }
+
+    fn lib_add_form(&mut self) {
+        let kind = match &self.lib.page {
+            Page::Add { kind } => *kind,
+            _ => return,
+        };
+        let mut f = Vec::new();
+        match kind {
+            None => {
+                f.push(W::Heading("Add a server or cloud".into()));
+                push_choice(&mut f, "add:plex", "Plex", "Sign in with Plex in your browser. Adds every server on your account.");
+                f.push(W::Row(vec![W::button("add:plex-token", "Use an address and token")]));
+                push_choice(&mut f, "add:jellyfin", "Jellyfin or Emby", "Server address, user name and password.");
+                push_choice(&mut f, "add:subsonic", "Navidrome or Subsonic", "Navidrome, Airsonic, Gonic and other Subsonic servers.");
+                push_choice(&mut f, "add:synology", "Synology Audio Station", "QuickConnect ID or DSM address, user and password.");
+                push_choice(&mut f, "add:webdav", "WebDAV or Nextcloud", "A WebDAV folder, such as Nextcloud or a NAS share.");
+                push_choice(&mut f, "add:share", "Network share (SMB)", "A folder another computer shares. Connect, then add it.");
+                push_choice(&mut f, "add:cloud", "Dropbox, Google Drive or OneDrive", "The folder from the Dropbox, Google Drive or OneDrive app on this computer.");
+                f.push(W::button("add:cancel", "Cancel"));
+            }
+            Some(k) => {
+                let info = kind_form(k);
+                let label = info.map(|k| k.label).unwrap_or(k);
+                let help = info.map(|k| k.help).unwrap_or("");
+                let url_ph = info.map(|k| k.url_ph).unwrap_or("http://");
+                if let Some(fl) = self.lib.fields.get_mut("srv_url") {
+                    fl.placeholder = url_ph.into();
+                }
+                if let Some(fl) = self.lib.fields.get_mut("srv_pass") {
+                    fl.placeholder = if k == "plex" { "X-Plex-Token".into() } else { "Password".into() };
+                }
+                f.push(W::Heading(label.into()));
+                if !help.is_empty() {
+                    f.push(W::Text(help.into()));
+                }
+                let ids = kind_fields(k);
+                if ids.contains(&"srv_name") {
+                    f.push(W::Row(vec![self.field("srv_name")]));
+                }
+                if ids.contains(&"srv_url") {
+                    f.push(W::Row(vec![self.field("srv_url")]));
+                }
+                let mut rest = Vec::new();
+                for id in ["srv_user", "srv_pass", "srv_otp"] {
+                    if ids.contains(&id) {
+                        rest.push(self.field(id));
+                    }
+                }
+                if !rest.is_empty() {
+                    f.push(W::Row(rest));
+                }
+                let https = self.value("srv_url").to_ascii_lowercase().starts_with("https://");
+                if https || self.lib.cert_error {
+                    f.push(W::Check { id: "srv:insecure".into(), label: "Accept a self-signed certificate".into(), checked: self.lib.insecure });
+                }
+                f.push(W::Row(vec![
+                    W::Button { id: "srv:add".into(), label: "Connect".into(), enabled: !self.lib.adding },
+                    W::button("add:cancel", "Cancel"),
+                ]));
+                if let Some((text, error)) = &self.lib.add_note {
+                    f.push(W::Note { text: text.clone(), error: *error });
+                }
+            }
+        }
+        self.lib.view.form = Some(f);
+        self.mark(Kind::Library);
+    }
+
     fn lib_form_action(&mut self, id: &str) {
-        let Some(b) = &self.backend else { return };
-        let folders: Vec<String> = self.lib.config["folders"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+        // Any other form button disarms Remove. The armed id itself still confirms.
+        if self.lib.armed.as_ref().is_some_and(|(i, _)| i != id) {
+            self.lib.armed = None;
+        }
+        // Settings still removes a folder on the first click. The hub confirms.
+        let on_network = matches!(&self.lib.page, Page::Network);
+        let destructive = id.starts_with("srv:rm:") || (on_network && id.starts_with("folder:rm:"));
+        if destructive {
+            self.lib.renaming = None;
+            if !self.lib_take_arm(id) {
+                self.lib_rebuild_form();
+                return;
+            }
+        } else {
+            self.lib.armed = None;
+        }
+        let keep_rename = matches!(id, "rename:save" | "rename:cancel") || id.starts_with("srv:rename:");
+        if !keep_rename {
+            self.lib.renaming = None;
+        }
         match id {
             "folder:add" => self.ask(crate::dialog::Ask::MusicFolder),
             "folder:path" => {
                 let p = self.value("folder_path");
                 if !p.is_empty() {
-                    let mut f = folders.clone();
-                    f.push(p);
-                    b.post("/api/config", json!({ "folders": f }), true);
-                    b.post("/api/library/rescan", json!({}), false);
+                    let mut folders = self.folder_list();
+                    folders.push(p);
                     self.clear(&["folder_path"]);
+                    self.lib_config_put("folders", json!(folders.clone()));
+                    if let Some(b) = &self.backend {
+                        b.post("/api/config", json!({ "folders": folders }), true);
+                        b.post("/api/library/rescan", json!({}), false);
+                    }
                 }
             }
             "folder:rescan" => {
-                b.rescan();
+                if let Some(b) = &self.backend {
+                    b.rescan();
+                }
                 self.lib.view.status = "Scanning…".into();
             }
             "share:connect" => {
                 let url = self.value("share");
-                b.post("/api/mount", json!({ "url": url }), false);
-                b.note(if cfg!(target_os = "macos") { "Finder is connecting. Then Add folder… › /Volumes." } else { "Connecting. Then add the share's folder." });
+                if let Some(b) = &self.backend {
+                    b.post("/api/mount", json!({ "url": url }), false);
+                    b.note(if cfg!(target_os = "macos") { "Finder is connecting. Then Add folder… › /Volumes." } else { "Connecting. Then add the share's folder." });
+                }
             }
-            "srv:kind" => self.lib.kind = (self.lib.kind + 1) % KINDS.len(),
             "srv:insecure" => self.lib.insecure = !self.lib.insecure,
             "srv:add" => {
-                let (kid, _, _) = KINDS[self.lib.kind % KINDS.len()];
+                if self.lib.adding {
+                    return;
+                }
+                let kind = match &self.lib.page {
+                    Page::Add { kind: Some(k) } => Some(*k),
+                    _ => None,
+                };
+                let Some(kind) = kind else {
+                    self.lib_rebuild_form();
+                    return;
+                };
                 let body = json!({
-                    "kind": kid,
+                    "kind": kind,
                     "name": self.value("srv_name"),
                     "url": self.value("srv_url"),
                     "username": self.value("srv_user"),
@@ -1544,38 +1996,155 @@ impl App {
                     "otp": self.value("srv_otp"),
                     "insecure": self.lib.insecure,
                 });
-                b.post("/api/accounts", body, true);
-                b.note("Connecting…");
-                self.clear(&["srv_pass", "srv_otp"]);
+                self.lib.adding = true;
+                self.lib.add_note = Some(("Connecting…".into(), false));
+                if let Some(b) = &self.backend {
+                    b.add_account(body);
+                }
             }
-            "plex:signin" => open_in_browser(&b.url("/auth/plex/login")),
+            "plex:signin" | "add:plex" => {
+                if let Some(b) = &self.backend {
+                    open_in_browser(&b.url("/auth/plex/login"));
+                }
+            }
+            "add:plex-token" => {
+                self.lib.cert_error = false;
+                self.lib.add_note = None;
+                self.lib_open(Page::Add { kind: Some("plex") }, true);
+            }
+            "add:jellyfin" | "add:subsonic" | "add:synology" | "add:webdav" => {
+                let kind = match id {
+                    "add:jellyfin" => "jellyfin",
+                    "add:subsonic" => "subsonic",
+                    "add:synology" => "synology",
+                    _ => "webdav",
+                };
+                self.lib.cert_error = false;
+                self.lib.add_note = None;
+                self.lib_open(Page::Add { kind: Some(kind) }, true);
+                self.lib_focus(Some("srv_url".into()));
+            }
+            "add:share" => {
+                self.lib_open(Page::Network, true);
+                self.lib_scroll_heading("Network shares");
+            }
+            "add:cloud" => {
+                self.lib_open(Page::Network, true);
+                self.lib_scroll_heading("Cloud folders");
+            }
+            "add:open" => {
+                self.lib.cert_error = false;
+                self.lib.add_note = None;
+                self.lib_open(Page::Add { kind: None }, true);
+            }
+            "add:cancel" | "net:open" => self.lib_open_network(),
             "dlna:search" => {
-                b.post("/api/sources/discover", json!({}), false);
-                b.note("Looking for DLNA servers…");
-                self.pending_refresh = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                if let Some(b) = &self.backend {
+                    b.post("/api/sources/discover", json!({}), false);
+                    b.note("Looking for DLNA servers…");
+                }
+                self.pending_refresh = Some(Instant::now() + Duration::from_secs(5));
             }
             "cloud:get" => open_in_browser("https://www.dropbox.com/install"),
             "cloud:look" => {
-                b.refresh_sources();
-                b.config();
+                if let Some(b) = &self.backend {
+                    b.refresh_sources();
+                    b.config();
+                }
             }
-            "sp:connect" => open_in_browser(&b.url("/auth/spotify/login")),
-            "sp:disconnect" => b.post("/api/spotify/logout", json!({}), true),
-            "sc:save" => b.post("/api/config", json!({ "soundcloudProfile": self.value("sc_profile") }), true),
+            "sp:connect" => {
+                if let Some(b) = &self.backend {
+                    open_in_browser(&b.url("/auth/spotify/login"));
+                }
+            }
+            "sp:disconnect" => {
+                if let Some(b) = &self.backend {
+                    b.post("/api/spotify/logout", json!({}), true);
+                }
+            }
+            "sc:save" => {
+                let profile = self.value("sc_profile");
+                if let Some(b) = &self.backend {
+                    b.post("/api/config", json!({ "soundcloudProfile": profile }), true);
+                }
+            }
+            "rename:cancel" => self.lib.renaming = None,
+            "rename:save" => {
+                let name = self.value("rename");
+                if !name.is_empty()
+                    && let Some(sid) = self.lib.renaming.clone()
+                {
+                    self.lib.renaming = None;
+                    self.lib_rename_source(sid, name);
+                }
+            }
             other => {
                 if let Some(i) = other.strip_prefix("folder:rm:").and_then(|i| i.parse::<usize>().ok()) {
-                    let f: Vec<String> = folders.iter().enumerate().filter(|(n, _)| *n != i).map(|(_, p)| p.clone()).collect();
-                    b.post("/api/config", json!({ "folders": f }), true);
+                    let mut folders = self.folder_list();
+                    if i < folders.len() {
+                        folders.remove(i);
+                        self.lib_config_put("folders", json!(folders.clone()));
+                        if let Some(b) = &self.backend {
+                            b.post("/api/config", json!({ "folders": folders }), true);
+                        }
+                    }
                 } else if let Some(sid) = other.strip_prefix("srv:rm:") {
-                    b.delete_account(sid.to_owned());
+                    let sid = sid.to_owned();
+                    self.lib.sources.retain(|s| s.id != sid);
+                    self.lib.health.remove(&sid);
+                    self.lib.checking.remove(&sid);
+                    if let Some(b) = &self.backend {
+                        b.delete_account(sid);
+                    }
+                } else if let Some(sid) = other.strip_prefix("srv:open:") {
+                    if let Some(s) = self.lib.sources.iter().find(|s| s.id == sid).cloned() {
+                        self.lib_open_root(&s);
+                    }
+                } else if let Some(sid) = other.strip_prefix("srv:rename:") {
+                    let name = self.lib.sources.iter().find(|s| s.id == sid).map(|s| s.name.clone()).unwrap_or_default();
+                    self.set_value("rename", &name);
+                    self.lib.renaming = Some(sid.to_owned());
+                    self.lib_focus(Some("rename".into()));
+                } else if let Some(sid) = other.strip_prefix("srv:hide:") {
+                    let mut ids = self.hidden_ids();
+                    if !ids.iter().any(|h| h == sid) {
+                        ids.push(sid.to_owned());
+                    }
+                    self.lib_set_hidden(ids);
+                } else if let Some(sid) = other.strip_prefix("srv:show:") {
+                    let ids: Vec<String> = self.hidden_ids().into_iter().filter(|h| h != sid).collect();
+                    self.lib_set_hidden(ids);
+                } else if let Some(i) = other.strip_prefix("found:").and_then(|i| i.parse::<usize>().ok()) {
+                    self.lib_add_found(i);
                 } else if let Some(text) = other.strip_prefix("copy:") {
                     crate::clipboard::set(text);
-                    b.note("Copied");
+                    if let Some(b) = &self.backend {
+                        b.note("Copied");
+                    } else {
+                        self.lib.view.status = "Copied".into();
+                    }
                 }
             }
         }
-        self.lib_form();
+        self.lib_rebuild_form();
     }
+}
+
+/// A server the user added (not DLNA, not a cloud folder, not a legacy Dropbox account).
+fn is_your_server(s: &Source) -> bool {
+    s.group == "network" && !s.id.starts_with("dlna-") && !s.id.starts_with("cloud-") && !s.id.starts_with("dropbox-")
+}
+
+/// A folder path that is a network share: macOS `/Volumes/<name>`, a Windows
+/// `\\server\share`, or a Linux mount under `/mnt`, `/media` or gvfs.
+fn is_network_path(p: &str) -> bool {
+    let p = p.trim();
+    p.starts_with("\\\\") || p.starts_with("/Volumes/") || p.starts_with("/mnt/") || p.starts_with("/media/") || p.contains("/gvfs/")
+}
+
+fn push_choice(f: &mut Vec<W>, id: &str, label: &str, text: &str) {
+    f.push(W::Row(vec![W::button(id, label)]));
+    f.push(W::Text(text.into()));
 }
 
 #[cfg(test)]
@@ -1583,7 +2152,7 @@ mod tests {
     #[test]
     fn recent_searches_sit_under_search_and_run_again() {
         let mut app = App::new(OutputKind::Null, None).unwrap();
-        app.lib.sources = vec![Source { id: "soundcloud".into(), name: "SoundCloud".into(), group: String::new(), roots: Vec::new(), search: true, needs_setup: false }];
+        app.lib.sources = vec![Source { id: "soundcloud".into(), name: "SoundCloud".into(), group: String::new(), roots: Vec::new(), search: true, needs_setup: false, kind: String::new(), address: String::new() }];
         app.lib_open(Page::Search { sid: "soundcloud".into(), title: "SoundCloud › Search".into() }, true);
         for q in ["deep house", "bluebird", "Deep House", "a", "b", "c", "d"] {
             app.lib.view.search.value = q.into();
@@ -1961,6 +2530,248 @@ mod tests {
         app.lib_submit("search");
         wait(&mut app, 30, |a| !a.lib.items.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn src(id: &str, name: &str, kind: &str, address: &str) -> Source {
+        Source {
+            id: id.into(),
+            name: name.into(),
+            group: "network".into(),
+            roots: vec![("root".into(), "Library".into())],
+            search: false,
+            needs_setup: false,
+            kind: kind.into(),
+            address: address.into(),
+        }
+    }
+
+    fn form(app: &App) -> &[W] {
+        app.lib.view.form.as_deref().unwrap()
+    }
+
+    fn item<'a>(app: &'a App, label: &str) -> &'a W {
+        form(app).iter().find(|w| matches!(w, W::Item { label: l, .. } if l == label)).unwrap_or_else(|| panic!("no item {label}"))
+    }
+
+    fn button_text(app: &App, id: &str) -> String {
+        fn walk(items: &[W], id: &str) -> Option<String> {
+            for w in items {
+                match w {
+                    W::Item { buttons, .. } => {
+                        if let Some((_, label)) = buttons.iter().find(|(i, _)| i == id) {
+                            return Some(label.clone());
+                        }
+                    }
+                    W::Row(children) => {
+                        if let Some(label) = walk(children, id) {
+                            return Some(label);
+                        }
+                    }
+                    W::Button { id: i, label, .. } if i == id => return Some(label.clone()),
+                    _ => {}
+                }
+            }
+            None
+        }
+        walk(form(app), id).unwrap_or_else(|| panic!("no button {id}"))
+    }
+
+    fn set_field(app: &mut App, id: &str, value: &str) {
+        let f = app.lib.fields.get_mut(id).unwrap();
+        f.value = value.into();
+        f.end();
+    }
+
+    #[test]
+    fn the_hub_lists_servers_shares_dlna_and_hidden_and_a_found_server_opens_add() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![
+            src("jellyfin-1", "DiskStation", "Jellyfin", "http://nas:8096"),
+            src("plex-1", "Plex Home", "Plex", "http://plex:32400"),
+            src("dlna-living", "Living room", "DLNA", ""),
+            src("cloud-dropbox", "Dropbox", "", ""),
+            src("dropbox-old", "Old Dropbox", "Dropbox", ""),
+        ];
+        app.lib.config = json!({
+            "hiddenSources": ["plex-1"],
+            "folders": ["/Users/me/Music", "/Volumes/media", "\\\\nas\\music"],
+            "found": [{ "kind": "jellyfin", "name": "Bedroom", "url": "http://bed:8096" }],
+        });
+        app.lib_open(Page::Network, true);
+        let labels: Vec<&str> = form(&app).iter().filter_map(|w| match w {
+            W::Item { label, .. } => Some(label.as_str()),
+            W::Heading(t) | W::Text(t) => Some(t.as_str()),
+            _ => None,
+        }).collect();
+        assert!(labels.contains(&"DiskStation"));
+        assert!(!labels.iter().any(|l| *l == "No servers yet."));
+        assert!(labels.contains(&"Living room"));
+        assert!(labels.contains(&"Dropbox"));
+        assert!(labels.contains(&"Old Dropbox"));
+        assert!(labels.contains(&"Bedroom"));
+        assert!(labels.contains(&"/Volumes/media"));
+        assert!(labels.contains(&"\\\\nas\\music"));
+        assert!(!labels.contains(&"/Users/me/Music"), "a local folder is not a network share");
+        assert!(labels.contains(&"Hidden (1)"));
+        assert!(labels.iter().filter(|l| **l == "Plex Home").count() == 1, "a hidden server is listed once, under Hidden");
+
+        let W::Item { detail, buttons, .. } = item(&app, "DiskStation") else { unreachable!() };
+        assert_eq!(detail, "Jellyfin · http://nas:8096 · Checking…");
+        assert_eq!(buttons.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(), ["Open", "Rename", "Remove"]);
+        let W::Item { detail, buttons, .. } = item(&app, "Living room") else { unreachable!() };
+        assert_eq!(detail, "DLNA");
+        assert!(buttons.iter().any(|(id, l)| id == "srv:hide:dlna-living" && l == "Hide"));
+        let W::Item { buttons, .. } = item(&app, "Plex Home") else { unreachable!() };
+        assert!(buttons.iter().any(|(id, l)| id == "srv:show:plex-1" && l == "Show"));
+        let W::Item { detail, buttons, .. } = item(&app, "Old Dropbox") else { unreachable!() };
+        assert!(detail.is_empty());
+        assert!(buttons.iter().any(|(_, l)| l == "Disconnect"));
+        let W::Item { detail, .. } = item(&app, "/Volumes/media") else { unreachable!() };
+        assert_eq!(detail, "Scanned into Local Media");
+
+        app.lib_form_action("found:0");
+        assert_eq!(app.lib.page, Page::Add { kind: Some("jellyfin") });
+        assert_eq!(app.lib.fields["srv_url"].value, "http://bed:8096");
+        assert_eq!(app.lib.fields["srv_name"].value, "Bedroom");
+        assert_eq!(app.lib.focus.as_deref(), Some("srv_user"));
+    }
+
+    #[test]
+    fn remove_needs_two_clicks_and_an_expired_arm_does_not_remove() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![src("jellyfin-1", "DiskStation", "Jellyfin", "http://nas:8096")];
+        app.lib_open(Page::Network, true);
+        app.lib_form_action("srv:rm:jellyfin-1");
+        assert_eq!(app.lib.sources.len(), 1, "the first click only arms remove");
+        assert_eq!(button_text(&app, "srv:rm:jellyfin-1"), "Really remove?");
+        app.lib_form_action("srv:rm:jellyfin-1");
+        assert!(app.lib.sources.is_empty(), "the second click removes it");
+        assert!(app.lib.armed.is_none());
+
+        app.lib.sources = vec![src("jellyfin-1", "DiskStation", "Jellyfin", "http://nas:8096")];
+        app.lib_open(Page::Network, true);
+        let past = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        app.lib.armed = Some(("srv:rm:jellyfin-1".into(), past));
+        app.lib_form_action("srv:rm:jellyfin-1");
+        assert_eq!(app.lib.sources.len(), 1, "an expired arm does not remove");
+        assert!(app.lib.armed.is_some());
+    }
+
+    #[test]
+    fn a_failed_add_keeps_the_password_and_a_success_opens_the_first_root() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib_open(Page::Add { kind: Some("jellyfin") }, true);
+        set_field(&mut app, "srv_pass", "secret");
+        set_field(&mut app, "srv_url", "http://nas:8096");
+        app.lib_added(Err("nothing answered at that address".into()));
+        assert_eq!(app.lib.fields["srv_pass"].value, "secret");
+        assert!(!app.lib.cert_error);
+        assert!(form(&app).iter().any(|w| matches!(w, W::Note { text, error: true } if text == "nothing answered at that address")));
+        assert!(!form(&app).iter().any(|w| matches!(w, W::Check { id, .. } if id == "srv:insecure")));
+
+        app.lib_added(Err(gamp_core::sources::CERT_UNTRUSTED.into()));
+        assert_eq!(app.lib.fields["srv_pass"].value, "secret");
+        assert!(app.lib.cert_error);
+        assert!(form(&app).iter().any(|w| matches!(w, W::Check { id, .. } if id == "srv:insecure")));
+        assert!(form(&app).iter().any(|w| matches!(w, W::Note { error: true, .. })));
+
+        app.lib.collapsed.insert("src:jellyfin-1".into());
+        app.lib_added(Ok(json!({
+            "id": "jellyfin-1",
+            "name": "DiskStation",
+            "roots": [{ "id": "favorites", "title": "Favorites" }],
+        })));
+        assert_eq!(app.lib.page, Page::List { sid: "jellyfin-1".into(), node: "favorites".into(), title: "DiskStation › Favorites".into() });
+        assert!(app.lib.fields["srv_pass"].value.is_empty());
+        assert!(app.lib.fields["srv_name"].value.is_empty());
+        assert!(app.lib.add_note.is_none());
+        assert!(!app.lib.collapsed.contains("src:jellyfin-1"));
+    }
+
+    #[test]
+    fn tab_on_plex_cycles_only_the_plex_fields() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib_open(Page::Add { kind: Some("plex") }, true);
+        let ids: Vec<String> = form(&app).iter().flat_map(|w| match w {
+            W::Field(id, _) => vec![id.clone()],
+            W::Row(children) => children.iter().filter_map(|c| match c { W::Field(id, _) => Some(id.clone()), _ => None }).collect(),
+            _ => Vec::new(),
+        }).collect();
+        assert_eq!(ids, ["srv_name", "srv_url", "srv_pass"]);
+        app.lib_focus(Some("srv_name".into()));
+        for next in ["srv_url", "srv_pass", "srv_name"] {
+            assert!(app.lib_key(&Key::Named(NamedKey::Tab), None));
+            assert_eq!(app.lib.focus.as_deref(), Some(next));
+        }
+    }
+
+    #[test]
+    fn network_paths_are_shares() {
+        assert!(is_network_path("/Volumes/media"));
+        assert!(is_network_path("  /Volumes/media  "));
+        assert!(!is_network_path("/Volumes"));
+        assert!(is_network_path("\\\\nas\\music"));
+        assert!(is_network_path("/mnt/nas"));
+        assert!(is_network_path("/media/usb"));
+        assert!(is_network_path("/run/user/1000/gvfs/smb-share:server=nas"));
+        assert!(!is_network_path("/Users/me/Music"));
+        assert!(!is_network_path("smb://nas/music"));
+        assert!(!is_network_path("C:\\Music"));
+        assert!(!is_network_path(""));
+    }
+
+    #[test]
+    fn a_second_connect_while_adding_is_ignored() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib_open(Page::Add { kind: Some("jellyfin") }, true);
+        app.lib_form_action("srv:add");
+        assert!(app.lib.adding);
+        assert_eq!(app.lib.add_note.as_ref().map(|(t, e)| (t.as_str(), *e)), Some(("Connecting…", false)));
+        let connect_off = form(&app).iter().any(|w| match w {
+            W::Row(children) => children.iter().any(|c| matches!(c, W::Button { id, enabled: false, .. } if id == "srv:add")),
+            _ => false,
+        });
+        assert!(connect_off, "Connect is disabled while an add is running");
+        app.lib_form_action("srv:add");
+        assert!(app.lib.adding);
+        assert_eq!(app.lib.add_note.as_ref().map(|(t, e)| (t.as_str(), *e)), Some(("Connecting…", false)));
+    }
+
+    #[test]
+    fn an_add_that_finishes_off_the_page_stays_put() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib_open(Page::Network, true);
+        app.lib.adding = true;
+        app.lib_added(Ok(json!({
+            "id": "jellyfin-1",
+            "name": "DiskStation",
+            "roots": [{ "id": "a", "title": "Library" }],
+        })));
+        assert_eq!(app.lib.page, Page::Network);
+        assert_eq!(app.lib.view.status, "Added DiskStation");
+        assert!(!app.lib.adding);
+        assert!(app.lib.add_note.is_none());
+
+        app.lib.adding = true;
+        app.lib_added(Err("nothing answered at that address".into()));
+        assert_eq!(app.lib.page, Page::Network);
+        assert_eq!(app.lib.view.status, "nothing answered at that address");
+        assert_eq!(app.lib.add_note.as_ref().map(|(t, e)| (t.as_str(), *e)), Some(("nothing answered at that address", true)));
+        assert!(!app.lib.adding);
+    }
+
+    #[test]
+    fn another_form_button_disarms_remove() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![src("jellyfin-1", "DiskStation", "Jellyfin", "http://nas:8096")];
+        app.lib_open(Page::Network, true);
+        app.lib_form_action("srv:rm:jellyfin-1");
+        assert_eq!(button_text(&app, "srv:rm:jellyfin-1"), "Really remove?");
+        app.lib_form_action("dlna:search");
+        assert!(app.lib.armed.is_none());
+        assert_eq!(button_text(&app, "srv:rm:jellyfin-1"), "Remove");
+        assert_eq!(app.lib.sources.len(), 1);
+        assert_eq!(app.lib.page, Page::Network);
     }
 
     #[test]

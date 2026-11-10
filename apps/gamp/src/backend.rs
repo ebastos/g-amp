@@ -36,6 +36,10 @@ pub enum Reply {
     Scan(gamp_core::library::Status),
     /// A museum skin, downloaded (or why not).
     Skin(Result<std::path::PathBuf, String>),
+    /// A source answered (or why the hub should say it didn't).
+    Health { sid: String, result: Result<(), String> },
+    /// An account was added, as `sources::info`, or why it wasn't.
+    Added(Result<serde_json::Value, String>),
 }
 
 pub struct Backend {
@@ -159,6 +163,35 @@ impl Backend {
             if then_refresh {
                 let _ = tx.send(Reply::Sources(catalog::sources().await));
                 let _ = tx.send(Reply::Config(reqwest_json(port, "/api/config", None).await.unwrap_or_default()));
+            }
+            if let Some(p) = proxy {
+                let _ = p.send_event(UserEvent::Wake);
+            }
+        });
+    }
+
+    /// Asks a server (or a cloud folder) whether it still answers.
+    pub fn check(&self, sid: String) {
+        self.spawn(async move {
+            let result = catalog::check(&sid).await.map_err(|e| e.1);
+            Reply::Health { sid, result }
+        });
+    }
+
+    /// Adds an account on this runtime and reports `sources::info` back.
+    /// The password stays in the form until `Reply::Added` says it worked.
+    pub fn add_account(&self, body: serde_json::Value) {
+        let tx = self.tx.clone();
+        let proxy = self.proxy.clone();
+        self.rt.spawn(async move {
+            let result = match serde_json::from_value::<gamp_core::sources::NewAccount>(body) {
+                Ok(new) => gamp_core::sources::add(new).await.map_err(|e| e.1),
+                Err(e) => Err(e.to_string()),
+            };
+            let ok = result.is_ok();
+            let _ = tx.send(Reply::Added(result));
+            if ok {
+                let _ = tx.send(Reply::Sources(catalog::sources().await));
             }
             if let Some(p) = proxy {
                 let _ = p.send_event(UserEvent::Wake);

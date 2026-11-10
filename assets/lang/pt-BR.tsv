@@ -356,3 +356,58 @@ Trending	Em alta
 Underground Trending	Em alta no underground
 Search again	Buscar de novo
 More	Mais
+OK	OK
+Checking…	Verificando…
+Hidden ({})	Ocultos ({})
+Open	Abrir
+Rename	Renomear
+Really remove?	Remover mesmo?
+Show	Mostrar
+Hide	Ocultar
+Add	Adicionar
+Connect	Conectar
+Plex	Plex
+Jellyfin	Jellyfin
+Emby	Emby
+Subsonic	Subsonic
+Synology	Synology
+WebDAV	WebDAV
+DLNA	DLNA
+X-Plex-Token	X-Plex-Token
+http://nas:8096	http://nas:8096
+http://nas:4533	http://nas:4533
+http://nas:32400	http://nas:32400
+https://nas:5006/music	https://nas:5006/music
+Your servers	Seus servidores
+No servers yet.	Nenhum servidor ainda.
+Cloud folders	Pastas na nuvem
+Network shares	Compartilhamentos de rede
+Scanned into Local Media	Incluído na mídia local
+Found on your network	Encontrado na sua rede
+Nothing found yet. DLNA servers on your network appear by themselves.	Nada encontrado ainda. Os servidores DLNA da sua rede aparecem sozinhos.
+Servers, cloud folders and network shares.	Servidores, pastas na nuvem e compartilhamentos de rede.
+Add a server or cloud…	Adicionar um servidor ou a nuvem…
+Add a server or cloud	Adicionar um servidor ou a nuvem
+Media servers, NAS boxes, cloud drives and network shares.	Servidores de mídia, aparelhos NAS, unidades na nuvem e compartilhamentos de rede.
+Manage Network & Cloud…	Gerenciar Rede e nuvem…
+Sign in with Plex in your browser. Adds every server on your account.	Entre com o Plex no navegador. Adiciona todos os servidores da sua conta.
+Use an address and token	Usar um endereço e um token
+Server address, user name and password.	Endereço do servidor, nome de usuário e senha.
+Navidrome or Subsonic	Navidrome ou Subsonic
+Navidrome, Airsonic, Gonic and other Subsonic servers.	Navidrome, Airsonic, Gonic e outros servidores Subsonic.
+QuickConnect ID or DSM address, user and password.	ID QuickConnect ou endereço do DSM, usuário e senha.
+WebDAV or Nextcloud	WebDAV ou Nextcloud
+A WebDAV folder, such as Nextcloud or a NAS share.	Uma pasta WebDAV, como o Nextcloud ou um compartilhamento de NAS.
+Network share (SMB)	Compartilhamento de rede (SMB)
+A folder another computer shares. Connect, then add it.	Uma pasta que outro computador compartilha. Conecte e depois adicione.
+Dropbox, Google Drive or OneDrive	Dropbox, Google Drive ou OneDrive
+The folder from the Dropbox, Google Drive or OneDrive app on this computer.	A pasta do aplicativo Dropbox, Google Drive ou OneDrive neste computador.
+The address you open Jellyfin or Emby at, like http://nas:8096.	O endereço em que você abre o Jellyfin ou o Emby, como http://nas:8096.
+The address you open Navidrome at, like http://nas:4533.	O endereço em que você abre o Navidrome, como http://nas:4533.
+Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one.	Seu ID QuickConnect, ou o endereço do DSM como http://diskstation:5000. Adicione o código de dois fatores se usar um.
+The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.	O endereço WebDAV da pasta, como https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.
+The server's address, like http://nas:32400, and an X-Plex-Token.	O endereço do servidor, como http://nas:32400, e um X-Plex-Token.
+This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.	O certificado deste servidor não é confiável. Se for o seu próprio NAS, marque «Aceitar certificado autoassinado».
+Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.	Adicione qualquer pasta. Unidades de rede funcionam depois de montadas no Finder (Ir › Conectar ao Servidor); elas aparecem em /Volumes.
+Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.	Instale o aplicativo do Dropbox, Google Drive ou OneDrive e entre: a pasta aparece aqui sozinha. As músicas são baixadas enquanto você as reproduz.
+Added {}	{} adicionado

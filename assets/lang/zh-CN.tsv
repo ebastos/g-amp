@@ -356,3 +356,58 @@ Trending	热门
 Underground Trending	地下热门
 Search again	再次搜索
 More	更多
+OK	正常
+Checking…	正在检查…
+Hidden ({})	已隐藏 ({})
+Open	打开
+Rename	重命名
+Really remove?	确定移除？
+Show	显示
+Hide	隐藏
+Add	添加
+Connect	连接
+Plex	Plex
+Jellyfin	Jellyfin
+Emby	Emby
+Subsonic	Subsonic
+Synology	Synology
+WebDAV	WebDAV
+DLNA	DLNA
+X-Plex-Token	X-Plex-Token
+http://nas:8096	http://nas:8096
+http://nas:4533	http://nas:4533
+http://nas:32400	http://nas:32400
+https://nas:5006/music	https://nas:5006/music
+Your servers	你的服务器
+No servers yet.	还没有服务器。
+Cloud folders	云文件夹
+Network shares	网络共享
+Scanned into Local Media	已扫描到本地媒体
+Found on your network	在你的网络上发现的
+Nothing found yet. DLNA servers on your network appear by themselves.	还没有发现。你网络上的 DLNA 服务器会自己出现。
+Servers, cloud folders and network shares.	服务器、云文件夹和网络共享。
+Add a server or cloud…	添加服务器或云…
+Add a server or cloud	添加服务器或云
+Media servers, NAS boxes, cloud drives and network shares.	媒体服务器、NAS、云盘和网络共享。
+Manage Network & Cloud…	管理网络和云…
+Sign in with Plex in your browser. Adds every server on your account.	在浏览器中登录 Plex。会添加你账户下的每一台服务器。
+Use an address and token	使用地址和令牌
+Server address, user name and password.	服务器地址、用户名和密码。
+Navidrome or Subsonic	Navidrome 或 Subsonic
+Navidrome, Airsonic, Gonic and other Subsonic servers.	Navidrome、Airsonic、Gonic 以及其他 Subsonic 服务器。
+QuickConnect ID or DSM address, user and password.	QuickConnect ID 或 DSM 地址、用户和密码。
+WebDAV or Nextcloud	WebDAV 或 Nextcloud
+A WebDAV folder, such as Nextcloud or a NAS share.	WebDAV 文件夹，例如 Nextcloud 或 NAS 共享。
+Network share (SMB)	网络共享 (SMB)
+A folder another computer shares. Connect, then add it.	另一台电脑共享的文件夹。先连接，再添加。
+Dropbox, Google Drive or OneDrive	Dropbox、Google Drive 或 OneDrive
+The folder from the Dropbox, Google Drive or OneDrive app on this computer.	这台电脑上 Dropbox、Google Drive 或 OneDrive 应用的文件夹。
+The address you open Jellyfin or Emby at, like http://nas:8096.	你打开 Jellyfin 或 Emby 所用的地址，例如 http://nas:8096。
+The address you open Navidrome at, like http://nas:4533.	你打开 Navidrome 所用的地址，例如 http://nas:4533。
+Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one.	你的 QuickConnect ID，或 DSM 地址，例如 http://diskstation:5000。如果启用了两步验证，请填上验证码。
+The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.	文件夹的 WebDAV 地址，例如 https://nas:5006/music。Nextcloud：https://cloud.example.com/remote.php/dav/files/you。
+The server's address, like http://nas:32400, and an X-Plex-Token.	服务器地址，例如 http://nas:32400，以及一个 X-Plex-Token。
+This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.	此服务器的证书不受信任。如果是你自己的 NAS，请勾选「接受自签名证书」。
+Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.	添加任意文件夹。网络驱动器在 Finder 中装载后即可使用（前往 › 连接服务器）；它们会出现在 /Volumes 下。
+Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.	安装 Dropbox、Google Drive 或 OneDrive 应用并登录：它的文件夹会自己出现在这里。歌曲在播放时下载。
+Added {}	已添加 {}

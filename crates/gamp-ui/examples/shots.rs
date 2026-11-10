@@ -119,4 +119,36 @@ fn main() {
     lib.status = "4 items".into();
     lw::draw(&mut f, &skin, &lib);
     save(&f, format!("{dir}/library-expanded.png"));
+
+    lib.search_shown = false;
+    lib.width = 720;
+    lib.height = 520;
+    lib.form = Some(vec![
+        lw::W::Heading("Network & Cloud".into()),
+        lw::W::Text("Servers, cloud folders and network shares.".into()),
+        lw::W::Row(vec![lw::W::button("add:open", "Add a server or cloud…"), lw::W::button("dlna:search", "Search the network again")]),
+        lw::W::Heading("Your servers".into()),
+        lw::W::Item {
+            id: "jellyfin-1".into(),
+            label: "DiskStation".into(),
+            detail: "Jellyfin · http://nas:8096 · OK".into(),
+            buttons: vec![("srv:open:jellyfin-1".into(), "Open".into()), ("srv:rename:jellyfin-1".into(), "Rename".into()), ("srv:rm:jellyfin-1".into(), "Remove".into())],
+        },
+        lw::W::Item {
+            id: "sub-1".into(),
+            label: "Navidrome".into(),
+            detail: "Subsonic · http://nas:4533 · OK".into(),
+            buttons: vec![("srv:open:sub-1".into(), "Open".into()), ("srv:rename:sub-1".into(), "Rename".into()), ("srv:rm:sub-1".into(), "Really remove?".into())],
+        },
+        lw::W::Heading("Found on your network".into()),
+        lw::W::Item {
+            id: "dlna-1".into(),
+            label: "Living room".into(),
+            detail: "DLNA".into(),
+            buttons: vec![("srv:open:dlna-1".into(), "Open".into()), ("srv:hide:dlna-1".into(), "Hide".into())],
+        },
+        lw::W::Note { text: "This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.".into(), error: true },
+    ]);
+    lw::draw(&mut f, &skin, &lib);
+    save(&f, format!("{dir}/library-hub.png"));
 }

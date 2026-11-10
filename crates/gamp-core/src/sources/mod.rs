@@ -260,22 +260,45 @@ pub fn bad_gateway(msg: impl Into<String>) -> ApiError {
     err(StatusCode::BAD_GATEWAY, msg)
 }
 
+/// Shown when a server's TLS certificate is not in the trust store.
+pub const CERT_UNTRUSTED: &str = "This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.";
+
+/// The reqwest error chain is about a certificate the app does not trust.
+pub fn is_cert_error(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    ["certificate", "unknownissuer", "invalid peer certificate", "self signed", "self-signed"].iter().any(|m| t.contains(m))
+}
+
 /// A network failure, said plainly.
+///
+/// reqwest reports a TLS handshake failure as `is_connect()`, so the certificate
+/// text is classified before the timeout and connect buckets.
 pub fn unreachable(name: &str, e: reqwest::Error) -> ApiError {
-    let why = if e.is_timeout() {
+    let mut chain = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(inner) = src {
+        chain = format!("{chain}: {inner}");
+        src = inner.source();
+    }
+    let why = describe(&chain, e.is_timeout(), e.is_connect());
+    if why == CERT_UNTRUSTED {
+        bad_gateway(CERT_UNTRUSTED)
+    } else {
+        bad_gateway(format!("Can't reach {name}: {why}"))
+    }
+}
+
+/// Turns an error chain into the sentence `unreachable` shows.
+fn describe(chain: &str, timeout: bool, connect: bool) -> String {
+    if is_cert_error(chain) {
+        CERT_UNTRUSTED.to_owned()
+    } else if timeout {
         "it took too long to answer".to_owned()
-    } else if e.is_connect() {
+    } else if connect {
         "nothing answered at that address".to_owned()
     } else {
-        let mut s = e.to_string();
-        let mut src = std::error::Error::source(&e);
-        while let Some(inner) = src {
-            s = format!("{s}: {inner}");
-            src = inner.source();
-        }
-        s
-    };
-    bad_gateway(format!("Can't reach {name}: {why}"))
+        chain.to_owned()
+    }
 }
 
 pub fn not_found(what: &str) -> ApiError {
@@ -576,26 +599,43 @@ fn finish(sid: &str, mut listing: Listing) -> Listing {
     listing
 }
 
+/// The per-kind listing. No tag reads, and track urls stay as the source sent them.
+async fn list_raw(acc: &Account, node: &str) -> Result<Listing, ApiError> {
+    match acc.kind {
+        Kind::Subsonic => subsonic::browse(acc, node).await,
+        Kind::Jellyfin => jellyfin::browse(acc, node).await,
+        Kind::Plex => plex::browse(acc, node).await,
+        Kind::Synology => synology::browse(acc, node).await,
+        Kind::Webdav => webdav::browse(acc, node).await,
+        Kind::Dropbox => dropbox::browse(acc, node).await,
+        Kind::Dlna => dlna::browse(acc, node).await,
+        Kind::Radio => radio::browse(node).await,
+        Kind::Podcasts => podcasts::browse(node).await,
+        Kind::Archive => archive::browse(node).await,
+        Kind::Audius => audius::browse(node).await,
+    }
+}
+
+/// Opens the account's first root, or fails if it does not answer within 8 seconds.
+/// Uses the raw listing so a health check does not download every file's tags.
+pub async fn check(sid: &str) -> Result<(), ApiError> {
+    let acc = find(sid).await?;
+    let name = acc.name.clone();
+    let root = roots(acc.kind).into_iter().next().map(|r| r.id.to_owned()).unwrap_or_default();
+    match tokio::time::timeout(std::time::Duration::from_secs(8), list_raw(&acc, &root)).await {
+        Ok(r) => r.map(|_| ()),
+        Err(_) => Err(bad_gateway(format!("Can't reach {name}: it took too long to answer"))),
+    }
+}
+
 pub async fn browse(sid: &str, node: &str) -> Result<Listing, ApiError> {
     let acc = find(sid).await?;
-    let listing = match acc.kind {
-        Kind::Subsonic => subsonic::browse(&acc, node).await?,
-        Kind::Jellyfin => jellyfin::browse(&acc, node).await?,
-        Kind::Plex => plex::browse(&acc, node).await?,
-        Kind::Synology => synology::browse(&acc, node).await?,
-        Kind::Webdav | Kind::Dropbox => {
-            let mut l = if acc.kind == Kind::Webdav { webdav::browse(&acc, node).await? } else { dropbox::browse(&acc, node).await? };
-            // File storage lists names only; read the tags from the files.
-            let a = &acc;
-            tags::enrich(sid, &mut l.items, |id| async move { upstream(a, &id).await.ok() }).await;
-            l
-        }
-        Kind::Dlna => dlna::browse(&acc, node).await?,
-        Kind::Radio => radio::browse(node).await?,
-        Kind::Podcasts => podcasts::browse(node).await?,
-        Kind::Archive => archive::browse(node).await?,
-        Kind::Audius => audius::browse(node).await?,
-    };
+    let mut listing = list_raw(&acc, node).await?;
+    if matches!(acc.kind, Kind::Webdav | Kind::Dropbox) {
+        // File storage lists names only; read the tags from the files.
+        let a = &acc;
+        tags::enrich(sid, &mut listing.items, |id| async move { upstream(a, &id).await.ok() }).await;
+    }
     Ok(finish(sid, listing))
 }
 
@@ -771,6 +811,28 @@ async fn icy(url: &str) -> Result<Response, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_errors() {
+        assert!(is_cert_error("invalid peer certificate: UnknownIssuer"));
+        assert!(is_cert_error("self signed certificate in chain"));
+        assert!(is_cert_error("SELF-SIGNED cert"));
+        assert!(is_cert_error("The certificate expired"));
+        assert!(!is_cert_error("connection refused"));
+        assert!(!is_cert_error("it took too long to answer"));
+        assert!(is_cert_error(CERT_UNTRUSTED));
+    }
+
+    #[test]
+    fn certificate_errors_win_over_connect() {
+        let chain = "error sending request: invalid peer certificate: UnknownIssuer";
+        assert_eq!(describe(chain, false, true), CERT_UNTRUSTED);
+        // A message that already is the certificate sentence stays that sentence.
+        assert_eq!(describe(CERT_UNTRUSTED, true, true), CERT_UNTRUSTED);
+        assert_eq!(describe("connection refused", false, true), "nothing answered at that address");
+        assert_eq!(describe("slow", true, false), "it took too long to answer");
+        assert_eq!(describe("parse error", false, false), "parse error");
+    }
 
     #[test]
     fn clocks() {
