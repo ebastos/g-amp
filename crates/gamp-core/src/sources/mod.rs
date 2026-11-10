@@ -17,6 +17,7 @@ pub mod dlna;
 pub mod dropbox;
 pub mod icy;
 pub mod jellyfin;
+pub mod lan;
 pub mod plex;
 pub mod podcasts;
 pub mod radio;
@@ -504,6 +505,7 @@ fn info(acc: &Account, hidden: bool) -> Value {
 
 pub async fn list() -> Value {
     dlna::refresh_soon();
+    lan::refresh_soon();
     let hidden = store::config().await.hidden_sources;
     let mark = |acc: &Account| info(acc, hidden.iter().any(|h| h == &acc.id));
     let mut out: Vec<Value> = accounts().await.iter().map(mark).collect();
