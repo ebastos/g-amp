@@ -47,6 +47,7 @@ pub fn router(port: u16, page: Router) -> Router {
         .route("/api/sources", get(|| async { Json(sources::list().await) }))
         .route("/api/sources/discover", post(|| async {
             sources::dlna::refresh(true);
+            sources::lan::refresh(true);
             StatusCode::NO_CONTENT
         }))
         .route("/api/radio/now", get(|Query(q): Query<HashMap<String, String>>| async move {
@@ -164,6 +165,8 @@ async fn public_config(dropbox_redirect: String) -> Value {
         "cloud": crate::cloud::folders().iter().map(|f| json!({ "name": f.name, "path": f.path })).collect::<Vec<_>>(),
         "dropbox": { "key": c.dropbox_key, "builtIn": !sources::dropbox::APP_KEY.is_empty(), "redirectUri": dropbox_redirect },
         "dlnaSearching": sources::dlna::searching(),
+        "found": sources::lan::found().await,
+        "lanSearching": sources::lan::searching(),
     })
 }
 

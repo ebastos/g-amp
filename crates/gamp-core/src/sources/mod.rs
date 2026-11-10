@@ -17,6 +17,7 @@ pub mod dlna;
 pub mod dropbox;
 pub mod icy;
 pub mod jellyfin;
+pub mod lan;
 pub mod plex;
 pub mod podcasts;
 pub mod radio;
@@ -488,6 +489,7 @@ fn info(acc: &Account) -> Value {
 
 pub async fn list() -> Value {
     dlna::refresh_soon();
+    lan::refresh_soon();
     let mut out: Vec<Value> = accounts().await.iter().map(info).collect();
     out.extend(dlna::servers().iter().map(info));
     for k in [Kind::Radio, Kind::Podcasts, Kind::Archive, Kind::Audius] {
