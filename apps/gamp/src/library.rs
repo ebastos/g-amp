@@ -142,6 +142,8 @@ pub struct LibState {
     pub cert_error: bool,
     /// Inline result under the Add form's Connect button: text, and whether it is an error.
     pub add_note: Option<(String, bool)>,
+    /// "Renamed", or the error, shown on the Network & Cloud hub.
+    pub hub_note: Option<(String, bool)>,
     /// An add is in flight. Connect is ignored until `Reply::Added` arrives.
     pub adding: bool,
     pub scan: Option<gamp_core::library::Status>,
@@ -200,6 +202,7 @@ impl Default for LibState {
             checking: BTreeSet::new(),
             cert_error: false,
             add_note: None,
+            hub_note: None,
             adding: false,
             scan: None,
             anchor: None,
@@ -290,7 +293,9 @@ fn source_menu(s: &Source) -> Vec<gamp_ui::menu::Item> {
     if can_remove(s) {
         menu.push(M::action(format!("lib:tree:remove:{}", s.id), "Remove…"));
     }
-    menu.push(M::action("lib:tree:manage", "Manage Network & Cloud…"));
+    if s.group == "network" {
+        menu.push(M::action("lib:tree:manage", "Manage Network & Cloud…"));
+    }
     menu
 }
 
@@ -449,14 +454,9 @@ impl App {
                         self.lib_rebuild_form();
                     }
                 }
-                Reply::Health { sid, result } => {
-                    self.lib.checking.remove(&sid);
-                    self.lib.health.insert(sid, (Instant::now(), result));
-                    if matches!(&self.lib.page, Page::Network) {
-                        self.lib_network_form();
-                    }
-                }
+                Reply::Health { sid, result } => self.lib_health(sid, result),
                 Reply::Added(r) => self.lib_added(r),
+                Reply::Renamed(r) => self.lib_renamed(r),
             }
         }
         self.mark(Kind::Library);
@@ -833,6 +833,25 @@ impl App {
         }
     }
 
+    /// A health check: unreachable failures mark the server offline, an OK check clears it.
+    fn lib_health(&mut self, sid: String, result: Result<(), String>) {
+        self.lib.checking.remove(&sid);
+        match &result {
+            Ok(()) => {
+                self.lib.offline.remove(&sid);
+            }
+            Err(e) if gamp_core::sources::is_unreachable(e) => {
+                self.lib.offline.insert(sid.clone(), e.clone());
+            }
+            Err(_) => {}
+        }
+        self.lib.health.insert(sid, (Instant::now(), result));
+        self.lib_tree();
+        if matches!(&self.lib.page, Page::Network) {
+            self.lib_network_form();
+        }
+    }
+
     /// Forget a failed browse so the next show asks again.
     fn lib_drop_failure(&mut self, key: &str) {
         if self.lib.failed.remove(key).is_some() {
@@ -872,7 +891,7 @@ impl App {
                 }
             }
             Err(e) => {
-                if network {
+                if network && gamp_core::sources::is_unreachable(&e) {
                     offline_changed = self.lib.offline.get(&sid).map(String::as_str) != Some(e.as_str());
                     self.lib.offline.insert(sid, e.clone());
                 }
@@ -1303,9 +1322,9 @@ impl App {
         self.lib.view.form_scroll = section.and_then(|p| lw::heading_scroll(&self.skin, &self.lib.view, p)).unwrap_or(0);
     }
 
-    /// Network & Cloud. A later phase opens the hub page from here.
+    /// Opens the Network & Cloud hub.
     pub fn lib_open_network_hub(&mut self) {
-        self.lib_open_settings(Some("Media servers"));
+        self.lib_open_network();
     }
 
     /// The group's name opens its first root when it has one, and the group with it.
@@ -1346,13 +1365,11 @@ impl App {
     }
 
     fn lib_hide_source(&mut self, sid: &str) {
-        let Some(b) = &self.backend else { return };
-        let mut list: Vec<String> = self.lib.config["hiddenSources"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
-        if !list.iter().any(|id| id == sid) {
-            list.push(sid.to_owned());
+        let mut ids = self.hidden_ids();
+        if !ids.iter().any(|id| id == sid) {
+            ids.push(sid.to_owned());
         }
-        b.post("/api/config", json!({ "hiddenSources": list }), true);
-        b.refresh_sources();
+        self.lib_set_hidden(ids);
     }
 
     /// What a `lib:tree:` menu id does. `Confirm` does not remove the account.
@@ -1872,6 +1889,7 @@ impl App {
 
     /// Opens the Network & Cloud hub. The tree label calls this.
     pub fn lib_open_network(&mut self) {
+        self.lib.hub_note = None;
         self.lib_open(Page::Network, true);
     }
 
@@ -1884,16 +1902,27 @@ impl App {
         self.lib.view.form_scroll = lw::heading_scroll(&self.skin, &self.lib.view, prefix).unwrap_or(0);
     }
 
-    /// Saves a source's new name. Wired to Backend::rename after Phase 2 merges.
+    /// Asks the backend to save the name. The hub note arrives with `Reply::Renamed`.
     fn lib_rename_source(&mut self, sid: String, name: String) {
         let name = name.trim().to_owned();
         if name.is_empty() {
             return;
         }
-        if let Some(s) = self.lib.sources.iter_mut().find(|s| s.id == sid) {
-            s.name = name;
+        self.lib.hub_note = None;
+        if let Some(b) = &self.backend {
+            b.rename(sid, name);
         }
-        self.lib.view.status = t("Saved").into();
+    }
+
+    /// What `Reply::Renamed` does: a note on the hub, never the main display.
+    fn lib_renamed(&mut self, r: Result<(), String>) {
+        self.lib.hub_note = Some(match r {
+            Ok(()) => (t("Renamed").into(), false),
+            Err(e) => (e, true),
+        });
+        if matches!(&self.lib.page, Page::Network) {
+            self.lib_network_form();
+        }
     }
 
     /// What `Reply::Added` does. On the Add page, an error stays on the form and
@@ -2012,8 +2041,11 @@ impl App {
             W::Heading("Network & Cloud".into()),
             W::Text("Servers, cloud folders and network shares.".into()),
             W::Row(vec![W::button("add:open", "Add a server or cloud…"), W::button("dlna:search", "Search the network again")]),
-            W::Heading("Your servers".into()),
         ];
+        if let Some((text, error)) = &self.lib.hub_note {
+            f.push(W::Note { text: text.clone(), error: *error });
+        }
+        f.push(W::Heading("Your servers".into()));
         let servers: Vec<&Source> = sources.iter().filter(|s| is_your_server(s) && !hidden.iter().any(|h| h == &s.id)).collect();
         if servers.is_empty() {
             f.push(W::Text("No servers yet.".into()));
@@ -2346,11 +2378,7 @@ impl App {
                     self.lib.renaming = Some(sid.to_owned());
                     self.lib_focus(Some("rename".into()));
                 } else if let Some(sid) = other.strip_prefix("srv:hide:") {
-                    let mut ids = self.hidden_ids();
-                    if !ids.iter().any(|h| h == sid) {
-                        ids.push(sid.to_owned());
-                    }
-                    self.lib_set_hidden(ids);
+                    self.lib_hide_source(sid);
                 } else if let Some(sid) = other.strip_prefix("srv:show:") {
                     let ids: Vec<String> = self.hidden_ids().into_iter().filter(|h| h != sid).collect();
                     self.lib_set_hidden(ids);
@@ -2759,7 +2787,7 @@ mod tests {
         let net = app.lib.view.tree.iter().position(|r| r.label == "Network & Cloud").unwrap();
         app.lib.hots = vec![(Hot::Tree(net), (0, 0, 140, 15))];
         app.lib_press(40, 4);
-        assert_eq!(app.lib.page, Page::Settings);
+        assert_eq!(app.lib.page, Page::Network);
         assert!(!app.lib.collapsed.contains("network"));
     }
 
@@ -2807,11 +2835,12 @@ mod tests {
             source("radio", "Internet Radio", "internet", &[("top", "Top Stations")], false),
         ];
         app.lib_tree();
-        app.lib_listing(list_key("nas", "albums"), Err("no route".into()));
+        let down = "Can't reach Navidrome: nothing answered at that address";
+        app.lib_listing(list_key("nas", "albums"), Err(down.into()));
         let row = app.lib.view.tree.iter().find(|r| r.label.starts_with("Navidrome")).unwrap();
         assert!(row.dim);
         assert!(row.label.ends_with(" · offline"));
-        assert_eq!(app.lib.offline.get("nas").map(String::as_str), Some("no route"));
+        assert_eq!(app.lib.offline.get("nas").map(String::as_str), Some(down));
 
         app.lib_listing(list_key("radio", "top"), Err("nope".into()));
         assert!(!app.lib.offline.contains_key("radio"));
@@ -2821,6 +2850,45 @@ mod tests {
         let row = app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap();
         assert!(!row.dim);
         assert!(app.lib.offline.is_empty());
+    }
+
+    #[test]
+    fn a_missing_folder_does_not_mark_the_server_offline() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![source("nas", "Navidrome", "network", &[("albums", "Albums")], true)];
+        app.lib_tree();
+        app.lib_listing(list_key("nas", "missing"), Err("Not found".into()));
+        assert!(!app.lib.offline.contains_key("nas"));
+        let row = app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap();
+        assert!(!row.dim);
+        assert!(!row.label.contains("offline"));
+
+        app.lib_listing(list_key("nas", "gone"), Err("That list isn't there".into()));
+        assert!(!app.lib.offline.contains_key("nas"));
+        assert!(!app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap().dim);
+    }
+
+    #[test]
+    fn a_health_check_marks_offline_only_when_the_server_cannot_be_reached() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![source("nas", "Navidrome", "network", &[("albums", "Albums")], true)];
+        app.lib.checking.insert("nas".into());
+        app.lib_tree();
+        app.lib_health("nas".into(), Err("Not found".into()));
+        assert!(!app.lib.offline.contains_key("nas"));
+        assert!(app.lib.checking.is_empty());
+        assert!(!app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap().dim);
+
+        let slow = "Can't reach Navidrome: it took too long to answer";
+        app.lib_health("nas".into(), Err(slow.into()));
+        let row = app.lib.view.tree.iter().find(|r| r.label.starts_with("Navidrome")).unwrap();
+        assert!(row.dim);
+        assert!(row.label.ends_with(" · offline"));
+        assert_eq!(app.lib.offline.get("nas").map(String::as_str), Some(slow));
+
+        app.lib_health("nas".into(), Ok(()));
+        assert!(app.lib.offline.is_empty());
+        assert!(!app.lib.view.tree.iter().find(|r| r.label == "Navidrome").unwrap().dim);
     }
 
     #[test]
@@ -2839,6 +2907,13 @@ mod tests {
         assert!(!ids(&cloud).iter().any(|id| id.starts_with("lib:tree:remove")));
         assert!(!ids(&radio).iter().any(|id| id.starts_with("lib:tree:hide:") || id.starts_with("lib:tree:remove")));
         assert!(ids(&radio).iter().any(|id| id == "lib:tree:open:radio"));
+        assert!(ids(&account).iter().any(|id| id == "lib:tree:manage"));
+        assert!(ids(&dlna).iter().any(|id| id == "lib:tree:manage"));
+        assert!(ids(&cloud).iter().any(|id| id == "lib:tree:manage"));
+        for (id, group) in [("radio", "internet"), ("podcasts", "internet"), ("archive", "internet"), ("audius", "internet"), ("soundcloud", "soundcloud"), ("spotify", "spotify"), ("skins", "skins"), ("local", "local")] {
+            let s = source(id, id, group, &[("top", "Top")], false);
+            assert!(!ids(&s).iter().any(|item| item == "lib:tree:manage"), "{id}");
+        }
 
         assert!(matches!(tree_cmd("lib:tree:remove:plex-1"), Some(TreeCmd::Confirm(sid)) if sid == "plex-1"));
         assert!(matches!(tree_cmd("lib:tree:remove!:plex-1"), Some(TreeCmd::Remove(_))));
@@ -2853,6 +2928,8 @@ mod tests {
         app.menu_action("lib:tree:remove:plex-1", None);
         assert_eq!(app.lib.sources.len(), 2, "asking does not delete");
         assert!(app.backend.is_none());
+        app.lib_tree_action("lib:tree:hide:dlna-tv", None);
+        assert_eq!(app.lib.config["hiddenSources"], json!(["dlna-tv"]));
 
         // The server starts closed, so open it to reach the leaf.
         app.lib.opened.insert("src:plex-1".into());
@@ -3085,6 +3162,27 @@ mod tests {
         assert_eq!(app.lib.fields["srv_url"].value, "http://bed:8096");
         assert_eq!(app.lib.fields["srv_name"].value, "Bedroom");
         assert_eq!(app.lib.focus.as_deref(), Some("srv_user"));
+
+        app.lib.config["found"] = json!([{ "kind": "emby", "name": "Attic", "url": "http://attic:8096" }]);
+        app.lib_open(Page::Network, true);
+        app.lib_form_action("found:0");
+        assert_eq!(app.lib.page, Page::Add { kind: Some("jellyfin") });
+        assert_eq!(app.lib.fields["srv_url"].value, "http://attic:8096");
+        assert_eq!(app.lib.fields["srv_name"].value, "Attic");
+        assert_eq!(app.lib.focus.as_deref(), Some("srv_user"));
+    }
+
+    #[test]
+    fn a_rename_shows_renamed_or_the_error_on_the_hub() {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        app.lib.sources = vec![src("jellyfin-1", "DiskStation", "Jellyfin", "http://nas:8096")];
+        app.lib_open(Page::Network, true);
+        app.lib_renamed(Ok(()));
+        assert!(form(&app).iter().any(|w| matches!(w, W::Note { text, error: false } if text == "Renamed")));
+        assert!(app.main.message.is_none());
+        app.lib_renamed(Err("That source isn't there".into()));
+        assert!(form(&app).iter().any(|w| matches!(w, W::Note { text, error: true } if text == "That source isn't there")));
+        assert!(app.main.message.is_none());
     }
 
     #[test]

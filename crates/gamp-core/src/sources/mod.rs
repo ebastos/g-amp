@@ -264,6 +264,11 @@ pub fn bad_gateway(msg: impl Into<String>) -> ApiError {
 /// Shown when a server's TLS certificate is not in the trust store.
 pub const CERT_UNTRUSTED: &str = "This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.";
 
+/// The timeout sentence `unreachable` puts after `Can't reach {name}: `.
+const TOOK_TOO_LONG: &str = "it took too long to answer";
+/// The connect sentence `unreachable` puts after `Can't reach {name}: `.
+const NOTHING_ANSWERED: &str = "nothing answered at that address";
+
 /// The reqwest error chain is about a certificate the app does not trust.
 pub fn is_cert_error(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
@@ -289,14 +294,21 @@ pub fn unreachable(name: &str, e: reqwest::Error) -> ApiError {
     }
 }
 
+/// Whether `msg` says the server could not be reached: [`CERT_UNTRUSTED`], or a
+/// `Can't reach …` sentence from [`unreachable`], [`check`], or the Plex and
+/// Synology address lists.
+pub fn is_unreachable(msg: &str) -> bool {
+    msg == CERT_UNTRUSTED || msg.starts_with("Can't reach ")
+}
+
 /// Turns an error chain into the sentence `unreachable` shows.
 fn describe(chain: &str, timeout: bool, connect: bool) -> String {
     if is_cert_error(chain) {
         CERT_UNTRUSTED.to_owned()
     } else if timeout {
-        "it took too long to answer".to_owned()
+        TOOK_TOO_LONG.to_owned()
     } else if connect {
-        "nothing answered at that address".to_owned()
+        NOTHING_ANSWERED.to_owned()
     } else {
         chain.to_owned()
     }
@@ -644,7 +656,7 @@ pub async fn check(sid: &str) -> Result<(), ApiError> {
     let root = roots(acc.kind).into_iter().next().map(|r| r.id.to_owned()).unwrap_or_default();
     match tokio::time::timeout(std::time::Duration::from_secs(8), list_raw(&acc, &root)).await {
         Ok(r) => r.map(|_| ()),
-        Err(_) => Err(bad_gateway(format!("Can't reach {name}: it took too long to answer"))),
+        Err(_) => Err(bad_gateway(format!("Can't reach {name}: {TOOK_TOO_LONG}"))),
     }
 }
 
@@ -852,6 +864,21 @@ mod tests {
         assert_eq!(describe("connection refused", false, true), "nothing answered at that address");
         assert_eq!(describe("slow", true, false), "it took too long to answer");
         assert_eq!(describe("parse error", false, false), "parse error");
+    }
+
+    #[test]
+    fn unreachable_texts() {
+        assert!(is_unreachable(CERT_UNTRUSTED));
+        assert!(is_unreachable("Can't reach Navidrome: it took too long to answer"));
+        assert!(is_unreachable("Can't reach Navidrome: nothing answered at that address"));
+        assert!(is_unreachable("Can't reach Navidrome: error sending request: connection reset"));
+        assert!(!is_unreachable("Not found"));
+        assert!(!is_unreachable("That list isn't there"));
+        assert!(!is_unreachable("it took too long to answer"));
+        assert!(!is_unreachable("nothing answered at that address"));
+        assert!(is_unreachable("Can't reach Plex at any of its addresses"));
+        assert!(is_unreachable("Can't reach DiskStation at http://a, http://b"));
+        assert!(!is_unreachable(""));
     }
 
     #[test]

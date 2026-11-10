@@ -40,6 +40,8 @@ pub enum Reply {
     Health { sid: String, result: Result<(), String> },
     /// An account was added, as `sources::info`, or why it wasn't.
     Added(Result<serde_json::Value, String>),
+    /// The account's display name was saved, or why it wasn't.
+    Renamed(Result<(), String>),
 }
 
 pub struct Backend {
@@ -211,14 +213,13 @@ impl Backend {
         });
     }
 
-    /// The saved account's display name, then the source list again.
-    /// The tree menu grows a Rename item in a later phase; nothing calls this yet.
-    #[allow(dead_code)]
+    /// Saves the account's display name, then the source list again.
     pub fn rename(&self, id: String, name: String) {
         let tx = self.tx.clone();
         let proxy = self.proxy.clone();
         self.rt.spawn(async move {
-            let _ = gamp_core::sources::rename(&id, &name).await;
+            let result = gamp_core::sources::rename(&id, &name).await.map(|_| ()).map_err(|e| e.1);
+            let _ = tx.send(Reply::Renamed(result));
             let _ = tx.send(Reply::Sources(catalog::sources().await));
             if let Some(p) = proxy {
                 let _ = p.send_event(UserEvent::Wake);
