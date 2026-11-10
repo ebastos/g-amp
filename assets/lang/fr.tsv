@@ -364,3 +364,55 @@ Hide	Masquer
 Remove…	Retirer…
 Remove {}	Retirer {}
 Manage Network & Cloud…	Gérer Réseau et cloud…
+OK	OK
+Checking…	Vérification…
+Hidden ({})	Masqués ({})
+Rename	Renommer
+Really remove?	Vraiment retirer ?
+Show	Afficher
+Add	Ajouter
+Connect	Connecter
+Plex	Plex
+Jellyfin	Jellyfin
+Emby	Emby
+Subsonic	Subsonic
+Synology	Synology
+WebDAV	WebDAV
+DLNA	DLNA
+X-Plex-Token	X-Plex-Token
+http://nas:8096	http://nas:8096
+http://nas:4533	http://nas:4533
+http://nas:32400	http://nas:32400
+https://nas:5006/music	https://nas:5006/music
+Your servers	Vos serveurs
+No servers yet.	Pas encore de serveurs.
+Cloud folders	Dossiers cloud
+Network shares	Partages réseau
+Scanned into Local Media	Ajouté aux médias locaux
+Found on your network	Trouvé sur votre réseau
+Nothing found yet. DLNA servers on your network appear by themselves.	Rien pour l'instant. Les serveurs DLNA de votre réseau apparaissent d'eux-mêmes.
+Servers, cloud folders and network shares.	Serveurs, dossiers cloud et partages réseau.
+Add a server or cloud…	Ajouter un serveur ou un cloud…
+Add a server or cloud	Ajouter un serveur ou un cloud
+Media servers, NAS boxes, cloud drives and network shares.	Serveurs multimédias, boîtiers NAS, lecteurs cloud et partages réseau.
+Sign in with Plex in your browser. Adds every server on your account.	Connectez-vous à Plex dans votre navigateur. Ajoute tous les serveurs de votre compte.
+Use an address and token	Utiliser une adresse et un jeton
+Server address, user name and password.	Adresse du serveur, nom d'utilisateur et mot de passe.
+Navidrome or Subsonic	Navidrome ou Subsonic
+Navidrome, Airsonic, Gonic and other Subsonic servers.	Navidrome, Airsonic, Gonic et les autres serveurs Subsonic.
+QuickConnect ID or DSM address, user and password.	Identifiant QuickConnect ou adresse DSM, utilisateur et mot de passe.
+WebDAV or Nextcloud	WebDAV ou Nextcloud
+A WebDAV folder, such as Nextcloud or a NAS share.	Un dossier WebDAV, comme Nextcloud ou un partage NAS.
+Network share (SMB)	Partage réseau (SMB)
+A folder another computer shares. Connect, then add it.	Un dossier qu'un autre ordinateur partage. Connectez-le, puis ajoutez-le.
+Dropbox, Google Drive or OneDrive	Dropbox, Google Drive ou OneDrive
+The folder from the Dropbox, Google Drive or OneDrive app on this computer.	Le dossier de l'application Dropbox, Google Drive ou OneDrive sur cet ordinateur.
+The address you open Jellyfin or Emby at, like http://nas:8096.	L'adresse à laquelle vous ouvrez Jellyfin ou Emby, par exemple http://nas:8096.
+The address you open Navidrome at, like http://nas:4533.	L'adresse à laquelle vous ouvrez Navidrome, par exemple http://nas:4533.
+Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one.	Votre identifiant QuickConnect, ou l'adresse DSM comme http://diskstation:5000. Ajoutez le code à deux facteurs si vous en utilisez un.
+The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.	L'adresse WebDAV du dossier, par exemple https://nas:5006/music. Nextcloud : https://cloud.example.com/remote.php/dav/files/you.
+The server's address, like http://nas:32400, and an X-Plex-Token.	L'adresse du serveur, par exemple http://nas:32400, et un X-Plex-Token.
+This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.	Le certificat de ce serveur n'est pas fiable. S'il s'agit de votre propre NAS, cochez « Accepter un certificat auto-signé ».
+Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.	Ajoutez n'importe quel dossier. Les lecteurs réseau fonctionnent une fois montés dans le Finder (Aller › Se connecter au serveur) ; ils apparaissent sous /Volumes.
+Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.	Installez l'application Dropbox, Google Drive ou OneDrive et connectez-vous : son dossier apparaît ici tout seul. Les morceaux se téléchargent quand vous les lisez.
+Added {}	{} ajouté

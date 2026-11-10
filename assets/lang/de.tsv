@@ -364,3 +364,55 @@ Hide	Ausblenden
 Remove…	Entfernen…
 Remove {}	{} entfernen
 Manage Network & Cloud…	Netzwerk & Cloud verwalten…
+OK	OK
+Checking…	Prüfe…
+Hidden ({})	Ausgeblendet ({})
+Rename	Umbenennen
+Really remove?	Wirklich entfernen?
+Show	Einblenden
+Add	Hinzufügen
+Connect	Verbinden
+Plex	Plex
+Jellyfin	Jellyfin
+Emby	Emby
+Subsonic	Subsonic
+Synology	Synology
+WebDAV	WebDAV
+DLNA	DLNA
+X-Plex-Token	X-Plex-Token
+http://nas:8096	http://nas:8096
+http://nas:4533	http://nas:4533
+http://nas:32400	http://nas:32400
+https://nas:5006/music	https://nas:5006/music
+Your servers	Deine Server
+No servers yet.	Noch keine Server.
+Cloud folders	Cloud-Ordner
+Network shares	Netzwerkfreigaben
+Scanned into Local Media	In lokale Medien eingelesen
+Found on your network	In deinem Netzwerk gefunden
+Nothing found yet. DLNA servers on your network appear by themselves.	Noch nichts gefunden. DLNA-Server in deinem Netzwerk erscheinen von selbst.
+Servers, cloud folders and network shares.	Server, Cloud-Ordner und Netzwerkfreigaben.
+Add a server or cloud…	Server oder Cloud hinzufügen…
+Add a server or cloud	Server oder Cloud hinzufügen
+Media servers, NAS boxes, cloud drives and network shares.	Medienserver, NAS-Geräte, Cloud-Laufwerke und Netzwerkfreigaben.
+Sign in with Plex in your browser. Adds every server on your account.	Melde dich im Browser bei Plex an. Damit kommen alle Server deines Kontos hinzu.
+Use an address and token	Adresse und Token verwenden
+Server address, user name and password.	Serveradresse, Benutzername und Passwort.
+Navidrome or Subsonic	Navidrome oder Subsonic
+Navidrome, Airsonic, Gonic and other Subsonic servers.	Navidrome, Airsonic, Gonic und andere Subsonic-Server.
+QuickConnect ID or DSM address, user and password.	QuickConnect-ID oder DSM-Adresse, Benutzer und Passwort.
+WebDAV or Nextcloud	WebDAV oder Nextcloud
+A WebDAV folder, such as Nextcloud or a NAS share.	Ein WebDAV-Ordner, zum Beispiel Nextcloud oder eine NAS-Freigabe.
+Network share (SMB)	Netzwerkfreigabe (SMB)
+A folder another computer shares. Connect, then add it.	Ein Ordner, den ein anderer Computer freigibt. Verbinden, dann hinzufügen.
+Dropbox, Google Drive or OneDrive	Dropbox, Google Drive oder OneDrive
+The folder from the Dropbox, Google Drive or OneDrive app on this computer.	Der Ordner der Dropbox-, Google-Drive- oder OneDrive-App auf diesem Computer.
+The address you open Jellyfin or Emby at, like http://nas:8096.	Die Adresse, unter der du Jellyfin oder Emby öffnest, zum Beispiel http://nas:8096.
+The address you open Navidrome at, like http://nas:4533.	Die Adresse, unter der du Navidrome öffnest, zum Beispiel http://nas:4533.
+Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one.	Deine QuickConnect-ID oder die DSM-Adresse, zum Beispiel http://diskstation:5000. Füge den Zwei-Faktor-Code hinzu, falls du einen nutzt.
+The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.	Die WebDAV-Adresse des Ordners, zum Beispiel https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.
+The server's address, like http://nas:32400, and an X-Plex-Token.	Die Adresse des Servers, zum Beispiel http://nas:32400, und ein X-Plex-Token.
+This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.	Das Zertifikat dieses Servers ist nicht vertrauenswürdig. Wenn es dein eigenes NAS ist, aktiviere „Selbstsigniertes Zertifikat akzeptieren“.
+Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.	Füge einen beliebigen Ordner hinzu. Netzlaufwerke funktionieren, sobald sie im Finder verbunden sind (Gehe zu › Mit Server verbinden); sie erscheinen unter /Volumes.
+Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.	Installiere die App von Dropbox, Google Drive oder OneDrive und melde dich an: Ihr Ordner erscheint dann von selbst hier. Songs werden beim Abspielen geladen.
+Added {}	{} hinzugefügt

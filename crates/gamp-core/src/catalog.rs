@@ -24,10 +24,14 @@ pub struct Source {
     pub hidden: bool,
     /// A saved account the user can remove (not DLNA, cloud folders, or a built-in).
     pub removable: bool,
+    /// Kind label from an account (`sources::info`), empty otherwise.
+    pub kind: String,
+    /// Server address from an account, empty otherwise.
+    pub address: String,
 }
 
 pub async fn sources() -> Vec<Source> {
-    let mut out = vec![Source { id: "local".into(), name: "Local Media".into(), group: "local".into(), roots: vec![("audio".into(), "Audio".into())], search: false, needs_setup: false, hidden: false, removable: false }];
+    let mut out = vec![Source { id: "local".into(), name: "Local Media".into(), group: "local".into(), roots: vec![("audio".into(), "Audio".into())], search: false, needs_setup: false, hidden: false, removable: false, kind: String::new(), address: String::new() }];
     for v in sources::list().await.as_array().cloned().unwrap_or_default() {
         out.push(Source {
             id: s(&v["id"]),
@@ -38,11 +42,13 @@ pub async fn sources() -> Vec<Source> {
             needs_setup: false,
             hidden: v["hidden"] == true,
             removable: v["removable"] == true,
+            kind: s(&v["kindLabel"]),
+            address: s(&v["address"]),
         });
     }
     // Dropbox, Google Drive and OneDrive, through their desktop apps' folders.
     for f in crate::cloud::folders() {
-        out.push(Source { id: f.id, name: f.name, group: "network".into(), roots: vec![("files".into(), "Files".into())], search: false, needs_setup: false, hidden: false, removable: false });
+        out.push(Source { id: f.id, name: f.name, group: "network".into(), roots: vec![("files".into(), "Files".into())], search: false, needs_setup: false, hidden: false, removable: false, kind: String::new(), address: String::new() });
     }
     let sc = !crate::store::config().await.soundcloud_profile.is_empty();
     out.push(Source {
@@ -55,6 +61,8 @@ pub async fn sources() -> Vec<Source> {
         needs_setup: !sc,
         hidden: false,
         removable: false,
+        kind: String::new(),
+        address: String::new(),
     });
     let sp = spotify::connected().await;
     out.push(Source {
@@ -66,6 +74,8 @@ pub async fn sources() -> Vec<Source> {
         needs_setup: !sp,
         hidden: false,
         removable: false,
+        kind: String::new(),
+        address: String::new(),
     });
     out.push(Source {
         id: "skins".into(),
@@ -76,8 +86,23 @@ pub async fn sources() -> Vec<Source> {
         needs_setup: false,
         hidden: false,
         removable: false,
+        kind: String::new(),
+        address: String::new(),
     });
     out
+}
+
+/// Whether a source still answers. Cloud folders are here on disk; every
+/// other id is an account, checked through `sources::check`.
+pub async fn check(sid: &str) -> Result<(), ApiError> {
+    if sid.starts_with("cloud-") {
+        return if crate::cloud::folders().iter().any(|f| f.id == sid) {
+            Ok(())
+        } else {
+            Err(crate::http::err(axum::http::StatusCode::NOT_FOUND, "That cloud folder isn't on this computer any more"))
+        };
+    }
+    sources::check(sid).await
 }
 
 fn local_items() -> impl std::future::Future<Output = Vec<Item>> {

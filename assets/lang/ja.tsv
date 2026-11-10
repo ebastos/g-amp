@@ -364,3 +364,55 @@ Hide	隠す
 Remove…	削除…
 Remove {}	{} を削除
 Manage Network & Cloud…	ネットワークとクラウドを管理…
+OK	OK
+Checking…	確認中…
+Hidden ({})	非表示 ({})
+Rename	名前を変更
+Really remove?	本当に削除しますか？
+Show	表示
+Add	追加
+Connect	接続
+Plex	Plex
+Jellyfin	Jellyfin
+Emby	Emby
+Subsonic	Subsonic
+Synology	Synology
+WebDAV	WebDAV
+DLNA	DLNA
+X-Plex-Token	X-Plex-Token
+http://nas:8096	http://nas:8096
+http://nas:4533	http://nas:4533
+http://nas:32400	http://nas:32400
+https://nas:5006/music	https://nas:5006/music
+Your servers	あなたのサーバー
+No servers yet.	サーバーはまだありません。
+Cloud folders	クラウドフォルダ
+Network shares	ネットワーク共有
+Scanned into Local Media	ローカルメディアに取り込み済み
+Found on your network	ネットワーク上で見つかりました
+Nothing found yet. DLNA servers on your network appear by themselves.	まだ何も見つかりません。ネットワーク上の DLNA サーバーは自動で表示されます。
+Servers, cloud folders and network shares.	サーバー、クラウドフォルダ、ネットワーク共有。
+Add a server or cloud…	サーバーまたはクラウドを追加…
+Add a server or cloud	サーバーまたはクラウドを追加
+Media servers, NAS boxes, cloud drives and network shares.	メディアサーバー、NAS、クラウドドライブ、ネットワーク共有。
+Sign in with Plex in your browser. Adds every server on your account.	ブラウザで Plex にサインインします。アカウントのすべてのサーバーを追加します。
+Use an address and token	アドレスとトークンを使う
+Server address, user name and password.	サーバーのアドレス、ユーザー名、パスワード。
+Navidrome or Subsonic	Navidrome または Subsonic
+Navidrome, Airsonic, Gonic and other Subsonic servers.	Navidrome、Airsonic、Gonic などの Subsonic サーバー。
+QuickConnect ID or DSM address, user and password.	QuickConnect ID または DSM のアドレス、ユーザー、パスワード。
+WebDAV or Nextcloud	WebDAV または Nextcloud
+A WebDAV folder, such as Nextcloud or a NAS share.	Nextcloud や NAS の共有のような WebDAV フォルダ。
+Network share (SMB)	ネットワーク共有 (SMB)
+A folder another computer shares. Connect, then add it.	別のコンピュータが共有しているフォルダです。接続してから追加します。
+Dropbox, Google Drive or OneDrive	Dropbox、Google Drive または OneDrive
+The folder from the Dropbox, Google Drive or OneDrive app on this computer.	このコンピュータの Dropbox、Google Drive または OneDrive アプリのフォルダ。
+The address you open Jellyfin or Emby at, like http://nas:8096.	Jellyfin または Emby を開くアドレス。例: http://nas:8096。
+The address you open Navidrome at, like http://nas:4533.	Navidrome を開くアドレス。例: http://nas:4533。
+Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one.	QuickConnect ID、または http://diskstation:5000 のような DSM のアドレス。二段階認証コードを使っている場合はそれも入力します。
+The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.	フォルダの WebDAV アドレス。例: https://nas:5006/music。Nextcloud の場合: https://cloud.example.com/remote.php/dav/files/you。
+The server's address, like http://nas:32400, and an X-Plex-Token.	サーバーのアドレス（例: http://nas:32400）と X-Plex-Token。
+This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.	このサーバーの証明書は信頼されていません。自分の NAS なら「自己署名証明書を許可」にチェックを入れてください。
+Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.	任意のフォルダを追加します。ネットワークドライブは Finder でマウントすると使えます（移動 › サーバへ接続）。/Volumes の下に表示されます。
+Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.	Dropbox、Google Drive または OneDrive のアプリをインストールしてサインインします。フォルダはここに自動で表示されます。曲は再生するときにダウンロードされます。
+Added {}	{} を追加しました

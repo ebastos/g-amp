@@ -110,8 +110,10 @@ pub enum W {
     Check { id: String, label: String, checked: bool },
     /// Several widgets side by side (fields share the room left).
     Row(Vec<W>),
-    /// A line of text with a button at the end ("/Volumes/Music  [Remove]").
-    Item { id: String, label: String, button: String },
+    /// A line of text, an optional dim second line, and buttons at the right.
+    Item { id: String, label: String, detail: String, buttons: Vec<(String, String)> },
+    /// A wrapped line for an inline result. Errors use the current-track colour.
+    Note { text: String, error: bool },
     Gap,
 }
 
@@ -384,6 +386,16 @@ fn form_marked(frame: &mut Frame, skin: &Skin, area: R, items: &[W], scroll: i32
                 }
                 y += 2;
             }
+            W::Note { text, error } => {
+                let col = if *error { st.current } else { mix(st.normal, st.normal_bg, 0.15) };
+                for line in wrap(tr(text), aw - 12) {
+                    if clip(y, ROW) {
+                        font::draw(frame, ax + 6, y + 11, &line, PX, col, aw - 12, false);
+                    }
+                    y += 14;
+                }
+                y += 2;
+            }
             W::Gap => y += 6,
             W::Row(children) => {
                 y += row(frame, skin, (ax + 6, y, aw - 12), children, pressed, hots, |y, h| clip(y, h));
@@ -396,17 +408,28 @@ fn form_marked(frame: &mut Frame, skin: &Skin, area: R, items: &[W], scroll: i32
     y + scroll - ay
 }
 
+/// Width of an item's buttons, including the gaps between them.
+fn buttons_span(buttons: &[(String, String)]) -> i32 {
+    if buttons.is_empty() {
+        return 0;
+    }
+    buttons.iter().map(|(_, label)| button_w(label)).sum::<i32>() + 6 * (buttons.len() as i32 - 1)
+}
+
 fn row(frame: &mut Frame, skin: &Skin, at: (i32, i32, i32), items: &[W], pressed: &Option<Hot>, hots: &mut Vec<(Hot, R)>, visible: impl Fn(i32, i32) -> bool) -> i32 {
     let (x0, y, width) = at;
     let st = &skin.playlist;
     let h = 19;
+    // A detail line makes the row one text line taller.
+    let extra = if items.iter().any(|w| matches!(w, W::Item { detail, .. } if !detail.is_empty())) { 14 } else { 0 };
+    let row_h = h + extra;
     // Fixed widths first; fields share what's left.
     let fixed: i32 = items
         .iter()
         .map(|w| match w {
             W::Button { label, .. } => button_w(label),
             W::Check { label, .. } => font::measure(tr(label), PX, false) + 20,
-            W::Item { button, .. } => button_w(button),
+            W::Item { buttons, .. } => buttons_span(buttons),
             _ => 0,
         })
         .sum();
@@ -453,28 +476,42 @@ fn row(frame: &mut Frame, skin: &Skin, at: (i32, i32, i32), items: &[W], pressed
                 }
                 x += r.2 + 6;
             }
-            W::Item { id, label, button: b } => {
-                let bw = button_w(b);
-                if visible(y, h) {
-                    let text = font::ellipsize(label, PX, width - bw - 12, false);
-                    font::draw(frame, x, y + 14, &text, PX, st.normal, width - bw - 8, false);
-                    let r = (x0 + width - bw, y, bw, h);
-                    let down = *pressed == Some(Hot::Form(id.clone()));
-                    button(frame, r, b, down, true);
-                    hots.push((Hot::Form(id.clone()), r));
+            W::Item { label, detail, buttons, .. } => {
+                let span = buttons_span(buttons);
+                let text_w = (width - span - if span > 0 { 8 } else { 0 }).max(0);
+                if visible(y, row_h) {
+                    let text = font::ellipsize(&tr(label), PX, text_w, false);
+                    font::draw(frame, x, y + 14, &text, PX, st.normal, text_w, false);
+                    if !detail.is_empty() {
+                        let d = font::ellipsize(&tr(detail), PX, text_w, false);
+                        font::draw(frame, x, y + 27, &d, PX, mix(st.normal, st.normal_bg, 0.45), text_w, false);
+                    }
+                    // Right-aligned, in order: place from the right edge backwards.
+                    let mut bx = x0 + width;
+                    for (id, label) in buttons.iter().rev() {
+                        let bw = button_w(label);
+                        bx -= bw;
+                        let r = (bx, y, bw, h);
+                        let down = *pressed == Some(Hot::Form(id.clone()));
+                        button(frame, r, label, down, true);
+                        hots.push((Hot::Form(id.clone()), r));
+                        bx -= 6;
+                    }
                 }
                 x = x0 + width;
             }
             W::Text(t) => {
                 if visible(y, h) {
-                    font::draw(frame, x, y + 14, tr(t), PX, mix(st.normal, st.normal_bg, 0.15), x0 + width - x, false);
+                    let room = (x0 + width - x).max(0);
+                    let text = font::ellipsize(&tr(t), PX, room, false);
+                    font::draw(frame, x, y + 14, &text, PX, mix(st.normal, st.normal_bg, 0.15), room, false);
                 }
                 x += font::measure(tr(t), PX, false) + 6;
             }
             _ => {}
         }
     }
-    h + 5
+    row_h + 5
 }
 
 /// The column that carries the row's name (everything else is metadata).
@@ -788,7 +825,7 @@ mod tests {
         v.form = Some(vec![
             W::Heading("Music folders".into()),
             W::Text("Add any folder, including network shares mounted in Finder.".into()),
-            W::Item { id: "rm:0".into(), label: "/Volumes/music".into(), button: "Remove".into() },
+            W::Item { id: "rm:0".into(), label: "/Volumes/music".into(), detail: String::new(), buttons: vec![("rm:0".into(), "Remove".into())] },
             W::Row(vec![W::button("add", "Add folder…"), W::button("rescan", "Rescan")]),
             W::Heading("Media servers".into()),
             W::Row(vec![W::Field("url".into(), Field { placeholder: "http://nas:4533".into(), ..Default::default() }), W::Field("user".into(), Field { value: "me".into(), focused: true, caret: 2, ..Default::default() })]),
@@ -843,5 +880,58 @@ mod tests {
         assert!(nested.0 > glyph.0, "a nested group's glyph sits in from its parent");
         assert_eq!(hit(nested.0 + 1, nested.1 + ROW / 2), Some(Hot::TreeToggle(1)));
         assert_eq!(hit(rect(Hot::Tree(1)).0 + 2, nested.1 + ROW / 2), Some(Hot::Tree(1)));
+    }
+
+    fn form_hots(items: Vec<W>) -> Vec<(Hot, R)> {
+        let skin = Skin::default_skin();
+        let mut v = View { width: 720, height: 640, ..Default::default() };
+        v.form = Some(items);
+        let mut f = Frame::new(1, 1);
+        draw(&mut f, &skin, &v)
+    }
+
+    fn hot(hots: &[(Hot, R)], id: &str) -> R {
+        hots.iter().find(|(h, _)| *h == Hot::Form(id.into())).map(|(_, r)| *r).unwrap_or_else(|| panic!("no hot {id}"))
+    }
+
+    #[test]
+    fn item_buttons_are_separate_and_right_aligned() {
+        let hots = form_hots(vec![W::Item {
+            id: "srv".into(),
+            label: "DiskStation".into(),
+            detail: String::new(),
+            buttons: vec![("open".into(), "Open".into()), ("rename".into(), "Rename".into()), ("rm".into(), "Remove".into())],
+        }]);
+        let open = hot(&hots, "open");
+        let rename = hot(&hots, "rename");
+        let rm = hot(&hots, "rm");
+        assert!(open.0 + open.2 <= rename.0, "open and rename overlap");
+        assert!(rename.0 + rename.2 <= rm.0, "rename and remove overlap");
+        assert!(open.0 < rename.0 && rename.0 < rm.0, "buttons keep their order");
+        // The row's right edge is the form panel's content edge.
+        let v = View { width: 720, height: 640, ..Default::default() };
+        let (ix, _, iw, _) = v.inner();
+        let tb_x = ix + 150 + 6;
+        let tb_w = ix + iw - 2 - tb_x;
+        let content_right = tb_x + tb_w - 6;
+        assert_eq!(rm.0 + rm.2, content_right, "the last button sits on the right edge");
+        assert!(open.0 > tb_x + 6, "the first button is not left-aligned");
+    }
+
+    #[test]
+    fn an_item_with_detail_is_taller_and_a_note_grows_the_form() {
+        let item = |detail: &str| W::Item {
+            id: "srv".into(),
+            label: "DiskStation".into(),
+            detail: detail.into(),
+            buttons: vec![("open".into(), "Open".into())],
+        };
+        let y = |items: Vec<W>| hot(&form_hots(items), "tail").1;
+        let plain = y(vec![item(""), W::button("tail", "Tail")]);
+        let detailed = y(vec![item("Jellyfin · http://nas:8096 · OK"), W::button("tail", "Tail")]);
+        assert!(detailed > plain, "a detail line pushes the next widget down");
+        let bare = y(vec![W::button("tail", "Tail")]);
+        let noted = y(vec![W::Note { text: "This server's certificate isn't trusted.".into(), error: true }, W::button("tail", "Tail")]);
+        assert!(noted > bare, "a note makes the form taller");
     }
 }

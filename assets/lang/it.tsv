@@ -364,3 +364,55 @@ Hide	Nascondi
 Remove…	Rimuovi…
 Remove {}	Rimuovi {}
 Manage Network & Cloud…	Gestisci Rete e cloud…
+OK	OK
+Checking…	Controllo…
+Hidden ({})	Nascosti ({})
+Rename	Rinomina
+Really remove?	Rimuovere davvero?
+Show	Mostra
+Add	Aggiungi
+Connect	Connetti
+Plex	Plex
+Jellyfin	Jellyfin
+Emby	Emby
+Subsonic	Subsonic
+Synology	Synology
+WebDAV	WebDAV
+DLNA	DLNA
+X-Plex-Token	X-Plex-Token
+http://nas:8096	http://nas:8096
+http://nas:4533	http://nas:4533
+http://nas:32400	http://nas:32400
+https://nas:5006/music	https://nas:5006/music
+Your servers	I tuoi server
+No servers yet.	Ancora nessun server.
+Cloud folders	Cartelle cloud
+Network shares	Condivisioni di rete
+Scanned into Local Media	Incluso nei media locali
+Found on your network	Trovato nella tua rete
+Nothing found yet. DLNA servers on your network appear by themselves.	Ancora niente. I server DLNA della tua rete compaiono da soli.
+Servers, cloud folders and network shares.	Server, cartelle cloud e condivisioni di rete.
+Add a server or cloud…	Aggiungi un server o un cloud…
+Add a server or cloud	Aggiungi un server o un cloud
+Media servers, NAS boxes, cloud drives and network shares.	Server multimediali, NAS, unità cloud e condivisioni di rete.
+Sign in with Plex in your browser. Adds every server on your account.	Accedi a Plex nel browser. Aggiunge tutti i server del tuo account.
+Use an address and token	Usa un indirizzo e un token
+Server address, user name and password.	Indirizzo del server, nome utente e password.
+Navidrome or Subsonic	Navidrome o Subsonic
+Navidrome, Airsonic, Gonic and other Subsonic servers.	Navidrome, Airsonic, Gonic e altri server Subsonic.
+QuickConnect ID or DSM address, user and password.	ID QuickConnect o indirizzo DSM, utente e password.
+WebDAV or Nextcloud	WebDAV o Nextcloud
+A WebDAV folder, such as Nextcloud or a NAS share.	Una cartella WebDAV, come Nextcloud o una condivisione NAS.
+Network share (SMB)	Condivisione di rete (SMB)
+A folder another computer shares. Connect, then add it.	Una cartella condivisa da un altro computer. Connettila e poi aggiungila.
+Dropbox, Google Drive or OneDrive	Dropbox, Google Drive o OneDrive
+The folder from the Dropbox, Google Drive or OneDrive app on this computer.	La cartella dell'app Dropbox, Google Drive o OneDrive su questo computer.
+The address you open Jellyfin or Emby at, like http://nas:8096.	L'indirizzo a cui apri Jellyfin o Emby, per esempio http://nas:8096.
+The address you open Navidrome at, like http://nas:4533.	L'indirizzo a cui apri Navidrome, per esempio http://nas:4533.
+Your QuickConnect ID, or the DSM address like http://diskstation:5000. Add the two-step code if you use one.	Il tuo ID QuickConnect, o l'indirizzo DSM come http://diskstation:5000. Aggiungi il codice a due fattori se ne usi uno.
+The folder's WebDAV address, like https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.	L'indirizzo WebDAV della cartella, per esempio https://nas:5006/music. Nextcloud: https://cloud.example.com/remote.php/dav/files/you.
+The server's address, like http://nas:32400, and an X-Plex-Token.	L'indirizzo del server, per esempio http://nas:32400, e un X-Plex-Token.
+This server's certificate isn't trusted. If it's your own NAS, tick Accept a self-signed certificate.	Il certificato di questo server non è attendibile. Se è il tuo NAS, seleziona «Accetta un certificato autofirmato».
+Add any folder. Network drives work once mounted in Finder (Go › Connect to Server); they appear under /Volumes.	Aggiungi una cartella qualsiasi. Le unità di rete funzionano una volta montate nel Finder (Vai › Connettiti al server); compaiono sotto /Volumes.
+Install the Dropbox, Google Drive or OneDrive app and sign in: its folder shows up here by itself. Songs download as you play them.	Installa l'app Dropbox, Google Drive o OneDrive e accedi: la sua cartella compare qui da sola. I brani si scaricano mentre li riproduci.
+Added {}	{} aggiunto
