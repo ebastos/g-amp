@@ -115,8 +115,8 @@ pub struct LibState {
     pub items: Vec<Item>,
     /// Depth of each `items` row.
     pub levels: Vec<u8>,
-    /// A folder play waiting on its listing (`listing key`, enqueue).
-    pub pending_play: Option<(String, bool)>,
+    /// Play or Enqueue of a folder, waiting on the listings it still needs.
+    pub pending_play: Option<FolderPlay>,
     /// Child browse that failed, so the row can say why.
     pub failed: HashMap<String, String>,
     /// Child listings already asked for.
@@ -214,6 +214,23 @@ impl Default for LibState {
 /// The Favorites page's cache key.
 const FAVORITES_KEY: &str = "favorites\u{1f}favorites";
 
+/// Tracks one Play or Enqueue will put in the playlist. `lib_send` stops here too.
+const PLAY_LIMIT: usize = 5000;
+/// Folder listings one walk asks for at a time.
+const PLAY_FETCHES: usize = 32;
+
+/// Play or Enqueue still gathering the tracks inside nested folders.
+pub struct FolderPlay {
+    pub enqueue: bool,
+    pub sid: String,
+    /// Selected rows, in list order. Tracks are kept; folders are walked.
+    pub roots: Vec<Item>,
+    /// Listing keys this walk has asked for and not heard back from.
+    pub waiting: BTreeSet<String>,
+    /// Listing keys that failed during this walk. They are not asked for again.
+    pub tried: BTreeSet<String>,
+}
+
 fn is_playable(i: &Item) -> bool {
     i.kind == "track"
 }
@@ -225,6 +242,51 @@ fn is_filler(i: &Item) -> bool {
 
 fn list_key(sid: &str, node: &str) -> String {
     format!("{sid}\u{1f}{node}")
+}
+
+/// Tracks under `roots`, in listing order, and the folder ids still to fetch.
+/// A folder whose listing is in `tried` is skipped. The same track or folder is kept once.
+fn collect_tracks(cache: &HashMap<String, Listing>, sid: &str, roots: &[Item], tried: &BTreeSet<String>) -> (Vec<Item>, Vec<String>) {
+    let mut tracks = Vec::new();
+    let mut missing = Vec::new();
+    let mut folders = BTreeSet::new();
+    let mut songs = BTreeSet::new();
+    for root in roots {
+        walk_play(cache, sid, root, tried, &mut folders, &mut songs, &mut tracks, &mut missing);
+        if tracks.len() >= PLAY_LIMIT {
+            break;
+        }
+    }
+    tracks.truncate(PLAY_LIMIT);
+    (tracks, missing)
+}
+
+fn walk_play(cache: &HashMap<String, Listing>, sid: &str, item: &Item, tried: &BTreeSet<String>, folders: &mut BTreeSet<String>, songs: &mut BTreeSet<String>, tracks: &mut Vec<Item>, missing: &mut Vec<String>) {
+    if tracks.len() >= PLAY_LIMIT {
+        return;
+    }
+    if is_playable(item) {
+        if item.id.is_empty() || songs.insert(item.id.clone()) {
+            tracks.push(item.clone());
+        }
+        return;
+    }
+    if item.kind != "folder" || !folders.insert(item.id.clone()) {
+        return;
+    }
+    let key = list_key(sid, &item.id);
+    let Some(listing) = cache.get(&key) else {
+        if !tried.contains(&key) {
+            missing.push(item.id.clone());
+        }
+        return;
+    };
+    for child in &listing.items {
+        walk_play(cache, sid, child, tried, folders, songs, tracks, missing);
+        if tracks.len() >= PLAY_LIMIT {
+            return;
+        }
+    }
 }
 
 fn listing_sid(key: &str) -> &str {
@@ -865,6 +927,8 @@ impl App {
         let sid = listing_sid(&key).to_owned();
         let network = self.lib.sources.iter().any(|s| s.id == sid && s.group == "network");
         let mut offline_changed = false;
+        // A folder walk continues when one of the listings it asked for comes back.
+        let mut advance_play = false;
         match result {
             Ok(l) => {
                 if network {
@@ -885,9 +949,11 @@ impl App {
                 if play_now {
                     self.lib_send(streamed, false);
                 }
-                if let Some((_, enqueue)) = self.lib.pending_play.take_if(|(k, _)| k == &key) {
-                    let tracks = self.lib.cache.get(&key).map(|l| l.items.clone()).unwrap_or_default();
-                    self.lib_send(tracks, enqueue);
+                if self.lib.pending_play.as_ref().is_some_and(|p| p.waiting.contains(&key)) {
+                    if let Some(p) = self.lib.pending_play.as_mut() {
+                        p.waiting.remove(&key);
+                    }
+                    advance_play = true;
                 }
             }
             Err(e) => {
@@ -895,8 +961,12 @@ impl App {
                     offline_changed = self.lib.offline.get(&sid).map(String::as_str) != Some(e.as_str());
                     self.lib.offline.insert(sid, e.clone());
                 }
-                if self.lib.pending_play.as_ref().is_some_and(|(k, _)| k == &key) {
-                    self.lib.pending_play = None;
+                if self.lib.pending_play.as_ref().is_some_and(|p| p.waiting.contains(&key)) {
+                    if let Some(p) = self.lib.pending_play.as_mut() {
+                        p.waiting.remove(&key);
+                        p.tried.insert(key.clone());
+                    }
+                    advance_play = true;
                 }
                 if self.lib_is_open_child(&key) {
                     self.lib.failed.insert(key, e.clone());
@@ -913,6 +983,9 @@ impl App {
         }
         if offline_changed {
             self.lib_tree();
+        }
+        if advance_play {
+            self.lib_pump_play();
         }
     }
 
@@ -1207,30 +1280,59 @@ impl App {
         self.lib_open(Page::List { sid, node: item.id, title: item.title }, false);
     }
 
-    /// Plays the tracks in one folder's own listing. Sub-folders are not walked.
-    fn lib_play_folder(&mut self, folder: Item, enqueue: bool) {
+    /// Plays or enqueues every track inside the selected folders, at any depth.
+    fn lib_play_folders(&mut self, sel: &[Item], enqueue: bool) {
         let Some(sid) = self.lib_page_sid() else {
             self.lib.view.status = "Open it to play what's inside.".into();
             return;
         };
-        let key = list_key(&sid, &folder.id);
-        if let Some(tracks) = self.lib.cache.get(&key).map(|l| l.items.iter().filter(|i| is_playable(i)).cloned().collect::<Vec<_>>()) {
-            if tracks.is_empty() {
-                self.lib.view.status = "Open it to play what's inside.".into();
-            } else {
-                self.lib_send(tracks, enqueue);
+        let roots: Vec<Item> = sel.iter().filter(|i| is_playable(i) || i.kind == "folder").cloned().collect();
+        self.lib.pending_play = Some(FolderPlay { enqueue, sid, roots, waiting: BTreeSet::new(), tried: BTreeSet::new() });
+        self.lib_pump_play();
+    }
+
+    /// Fetches the next listings for the folder walk, or sends the tracks once they are known.
+    fn lib_pump_play(&mut self) {
+        let Some(play) = &self.lib.pending_play else { return };
+        let sid = play.sid.clone();
+        let enqueue = play.enqueue;
+        let failed = !play.tried.is_empty();
+        let (tracks, missing) = collect_tracks(&self.lib.cache, &sid, &play.roots, &play.tried);
+        if missing.is_empty() || tracks.len() >= PLAY_LIMIT {
+            self.lib.pending_play = None;
+            if tracks.is_empty() && failed {
+                self.mark(Kind::Library);
+                return;
+            }
+            let sent = !tracks.is_empty();
+            self.lib_send(tracks, enqueue);
+            if sent {
+                self.lib_rows();
             }
             return;
         }
-        self.lib.failed.remove(&key);
-        self.lib.pending_play = Some((key.clone(), enqueue));
-        if self.lib.inflight.insert(key.clone())
-            && let Some(b) = &self.backend
-        {
-            b.browse(key, sid, folder.id);
+        let mut start = Vec::new();
+        if let Some(play) = &mut self.lib.pending_play {
+            for id in missing {
+                if play.waiting.len() >= PLAY_FETCHES {
+                    break;
+                }
+                let key = list_key(&sid, &id);
+                if play.waiting.insert(key.clone()) {
+                    start.push((key, id));
+                }
+            }
         }
-        self.lib_show();
+        for (key, id) in start {
+            self.lib_drop_failure(&key);
+            if self.lib.inflight.insert(key.clone())
+                && let Some(b) = &self.backend
+            {
+                b.browse(key, sid.clone(), id);
+            }
+        }
         self.lib.view.status = "Loading…".into();
+        self.mark(Kind::Library);
     }
 
     /// Double-click or Enter: expand a folder, or play from that track.
@@ -1286,7 +1388,7 @@ impl App {
                 let (title, secs) = if is_preview(&i) { (tf("{} (preview)", &[&i.title]), Some(30.0)) } else { (i.title.clone(), i.duration) };
                 Some(Entry::remote(url, title, artist, secs, i.live))
             })
-            .take(5000)
+            .take(PLAY_LIMIT)
             .collect();
         if entries.is_empty() {
             self.lib.view.status = "Open it to play what's inside.".into();
@@ -1495,11 +1597,8 @@ impl App {
                 let sel = self.lib_selected();
                 if sel.is_empty() {
                     self.lib.view.status = "Select some tracks first.".into();
-                } else if sel.iter().any(is_playable) {
-                    self.lib_send(sel, enqueue);
                 } else if sel.iter().any(|i| i.kind == "folder") {
-                    let folder = sel.into_iter().find(|i| i.kind == "folder").unwrap();
-                    self.lib_play_folder(folder, enqueue);
+                    self.lib_play_folders(&sel, enqueue);
                 } else {
                     self.lib_send(sel, enqueue);
                 }
@@ -2513,6 +2612,20 @@ mod tests {
         app.lib.items.iter().map(|i| i.title.clone()).collect()
     }
 
+    fn queued(app: &App) -> Vec<String> {
+        app.playlist.entries.iter().map(|e| e.title.clone()).collect()
+    }
+
+    /// A Plex page showing `items`, already drawn.
+    fn plex(items: Vec<Item>) -> App {
+        let mut app = App::new(OutputKind::Null, None).unwrap();
+        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
+        app.lib.page = page.clone();
+        app.lib.cache.insert(page.key(), Listing::of(items));
+        app.lib_show();
+        app
+    }
+
     fn menu_ids(items: Option<Vec<gamp_ui::menu::Item>>) -> Vec<String> {
         items.into_iter().flatten().filter_map(|i| match i { gamp_ui::menu::Item::Action { id, .. } => Some(id), _ => None }).collect()
     }
@@ -2595,24 +2708,163 @@ mod tests {
     }
 
     #[test]
-    fn play_on_a_folder_waits_for_its_listing_and_sends_one_level() {
-        let mut app = App::new(OutputKind::Null, None).unwrap();
-        let page = Page::List { sid: "plex".into(), node: "root".into(), title: "Library".into() };
-        app.lib.page = page.clone();
-        app.lib.cache.insert(page.key(), Listing::of(vec![Item::folder("alb", "Abbey Road")]));
-        app.lib_show();
+    fn play_on_a_folder_walks_into_subfolders() {
+        let mut app = plex(vec![Item::folder("alb", "Abbey Road")]);
         app.lib.view.table.selected = BTreeSet::from([0]);
         app.lib_button("play");
         let key = list_key("plex", "alb");
-        assert_eq!(app.lib.pending_play, Some((key.clone(), false)));
+        assert!(app.lib.pending_play.as_ref().is_some_and(|p| !p.enqueue && p.waiting.contains(&key)));
         assert_eq!(app.lib.view.status, "Loading…");
         assert!(app.playlist.entries.is_empty());
 
-        app.lib.cache.insert(list_key("plex", "sub"), Listing::of(vec![track("deep", "Deep")]));
+        // The album's own tracks wait until the sub-folder has been read.
         app.lib_listing(key, Ok(Listing::of(vec![track("song", "Surface"), Item::folder("sub", "Sub")])));
+        let sub = list_key("plex", "sub");
+        assert!(app.lib.pending_play.as_ref().is_some_and(|p| p.waiting.contains(&sub)));
+        assert!(app.playlist.entries.is_empty());
+
+        app.lib_listing(sub, Ok(Listing::of(vec![track("deep", "Deep")])));
         assert!(app.lib.pending_play.is_none());
-        assert_eq!(app.playlist.entries.len(), 1);
-        assert_eq!(app.playlist.entries[0].title, "Surface");
+        assert_eq!(queued(&app), ["Surface", "Deep"]);
+    }
+
+    #[test]
+    fn a_cached_folder_plays_its_nested_tracks_immediately() {
+        let mut app = plex(vec![Item::folder("alb", "Abbey Road")]);
+        app.lib.cache.insert(list_key("plex", "alb"), Listing::of(vec![track("song", "Surface"), Item::folder("sub", "Sub")]));
+        app.lib.cache.insert(list_key("plex", "sub"), Listing::of(vec![track("deep", "Deep")]));
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("play");
+        assert!(app.lib.pending_play.is_none());
+        assert_eq!(queued(&app), ["Surface", "Deep"]);
+    }
+
+    #[test]
+    fn an_artist_plays_each_album_in_listed_order() {
+        let mut app = plex(vec![Item::folder("art", "Beatles")]);
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("play");
+        app.lib_listing(list_key("plex", "art"), Ok(Listing::of(vec![Item::folder("a1", "Abbey"), Item::folder("a2", "Revolver")])));
+        assert!(app.playlist.entries.is_empty(), "both albums are still to come");
+
+        // The later album answers first. Order stays the listing order.
+        app.lib_listing(list_key("plex", "a2"), Ok(Listing::of(vec![track("r", "Taxman")])));
+        assert!(app.playlist.entries.is_empty());
+        app.lib_listing(list_key("plex", "a1"), Ok(Listing::of(vec![track("s", "Come Together")])));
+        assert!(app.lib.pending_play.is_none());
+        assert_eq!(queued(&app), ["Come Together", "Taxman"]);
+    }
+
+    #[test]
+    fn a_folder_that_contains_itself_is_not_requested_again() {
+        let mut app = plex(vec![Item::folder("a", "A")]);
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("play");
+        let key = list_key("plex", "a");
+        assert!(app.lib.inflight.contains(&key));
+        app.lib_listing(key.clone(), Ok(Listing::of(vec![Item::folder("a", "A")])));
+        assert!(app.lib.pending_play.is_none());
+        assert!(!app.lib.inflight.contains(&key));
+        assert!(app.playlist.entries.is_empty());
+        assert_eq!(app.lib.view.status, "Open it to play what's inside.");
+    }
+
+    #[test]
+    fn a_failed_album_does_not_drop_the_other() {
+        let mut app = plex(vec![Item::folder("art", "Beatles")]);
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("play");
+        app.lib_listing(list_key("plex", "art"), Ok(Listing::of(vec![Item::folder("a1", "Abbey"), Item::folder("a2", "Revolver")])));
+        app.lib_listing(list_key("plex", "a1"), Ok(Listing::of(vec![track("s", "Come Together")])));
+        app.lib_listing(list_key("plex", "a2"), Err("nope".into()));
+        assert!(app.lib.pending_play.is_none());
+        assert_eq!(queued(&app), ["Come Together"]);
+        assert_eq!(app.lib.view.status, "1 items");
+    }
+
+    #[test]
+    fn enqueue_on_a_folder_appends_its_tracks() {
+        let mut app = plex(vec![Item::folder("alb", "Abbey Road")]);
+        app.lib.cache.insert(list_key("plex", "alb"), Listing::of(vec![track("song", "Surface")]));
+        app.playlist.set(vec![Entry::remote("/m/old".into(), "Old".into(), String::new(), None, false)]);
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("enqueue");
+        assert_eq!(queued(&app), ["Old", "Surface"]);
+        assert_eq!(app.player.status().state, gamp_audio::State::Stopped);
+    }
+
+    #[test]
+    fn play_on_tracks_does_not_walk_a_folder() {
+        let mut app = plex(vec![track("c", "C"), Item::folder("a", "A")]);
+        let c = app.lib.items.iter().position(|i| i.id == "c").unwrap();
+        app.lib.view.table.selected = BTreeSet::from([c]);
+        app.lib_button("play");
+        assert!(app.lib.pending_play.is_none());
+        assert_eq!(queued(&app), ["C"]);
+    }
+
+    #[test]
+    fn a_selected_track_and_a_selected_folder_both_play() {
+        let mut app = plex(vec![track("side", "Side"), Item::folder("alb", "Abbey")]);
+        app.lib.cache.insert(list_key("plex", "alb"), Listing::of(vec![track("song", "Surface")]));
+        app.lib.view.table.selected = BTreeSet::from([0, 1]);
+        app.lib_button("play");
+        assert_eq!(queued(&app), ["Side", "Surface"]);
+    }
+
+    #[test]
+    fn selected_folders_play_in_row_order() {
+        let mut app = plex(vec![Item::folder("a", "A"), Item::folder("b", "B")]);
+        app.lib.cache.insert(list_key("plex", "a"), Listing::of(vec![track("a1", "Alpha")]));
+        app.lib.cache.insert(list_key("plex", "b"), Listing::of(vec![track("b1", "Beta")]));
+        app.lib.view.table.selected = BTreeSet::from([0, 1]);
+        app.lib_button("enqueue");
+        assert_eq!(queued(&app), ["Alpha", "Beta"]);
+    }
+
+    #[test]
+    fn a_track_inside_a_selected_folder_is_added_once() {
+        let mut app = plex(vec![Item::folder("alb", "Abbey")]);
+        let page = app.lib.page.key();
+        app.lib.cache.insert(list_key("plex", "alb"), Listing::of(vec![track("song", "Surface"), Item::folder("sub", "Sub")]));
+        app.lib.cache.insert(list_key("plex", "sub"), Listing::of(vec![track("deep", "Deep")]));
+        app.lib.expanded.entry(page).or_default().insert("alb".into());
+        app.lib_show();
+        app.lib.view.table.selected = BTreeSet::from([0, 1]);
+        app.lib_button("play");
+        assert_eq!(queued(&app), ["Surface", "Deep"]);
+    }
+
+    #[test]
+    fn a_wide_folder_requests_a_few_listings_at_a_time() {
+        let mut app = plex(vec![Item::folder("rootf", "Root")]);
+        app.lib.view.table.selected = BTreeSet::from([0]);
+        app.lib_button("play");
+        let folders: Vec<Item> = (0..40).map(|i| Item::folder(format!("f{i:02}"), format!("F{i}"))).collect();
+        app.lib_listing(list_key("plex", "rootf"), Ok(Listing::of(folders)));
+        let waiting = app.lib.pending_play.as_ref().unwrap().waiting.clone();
+        assert_eq!(waiting.len(), PLAY_FETCHES);
+        assert!(waiting.contains(&list_key("plex", "f00")));
+        assert!(!waiting.contains(&list_key("plex", "f32")));
+        assert!(app.playlist.entries.is_empty());
+
+        app.lib_listing(list_key("plex", "f00"), Ok(Listing::of(vec![track("t", "T")])));
+        let waiting = &app.lib.pending_play.as_ref().unwrap().waiting;
+        assert_eq!(waiting.len(), PLAY_FETCHES);
+        assert!(!waiting.contains(&list_key("plex", "f00")));
+        assert!(waiting.contains(&list_key("plex", "f32")));
+        assert!(app.playlist.entries.is_empty());
+    }
+
+    #[test]
+    fn collect_stops_at_the_playlist_cap() {
+        let mut items: Vec<Item> = (0..PLAY_LIMIT + 10).map(|i| track(&format!("t{i}"), "T")).collect();
+        items.push(Item::folder("more", "More"));
+        let mut cache = HashMap::new();
+        cache.insert(list_key("plex", "alb"), Listing::of(items));
+        let (tracks, missing) = collect_tracks(&cache, "plex", &[Item::folder("alb", "Alb")], &BTreeSet::new());
+        assert_eq!(tracks.len(), PLAY_LIMIT);
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -2710,6 +2962,8 @@ mod tests {
         let on_glyph = menu_ids(app.lib_row_menu());
         assert_eq!(on_glyph, on_row);
         assert!(on_glyph.iter().any(|id| id == "lib:open"));
+        assert!(on_glyph.iter().any(|id| id == "lib:play"));
+        assert!(on_glyph.iter().any(|id| id == "lib:enqueue"));
     }
 
     #[test]
